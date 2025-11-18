@@ -19,7 +19,7 @@ import pyqtgraph as pg
 from lib import deque
 
 ADC_SAMPLING_FREQ = 20
-BUFFER_LENGTH = 900  # (s)
+BUFFER_LENGTH = 12 * 60 * 60 # (s)
 ADC_RESOLUTION = 10
 ADC_N = (1 << ADC_RESOLUTION) - 1
 
@@ -699,11 +699,24 @@ class LMP91000UI(QWidget):
         self.plot_item1.showGrid(x=True, y=True)
         self.plot_item1.addLegend()
 
+        self.plot1_auto_range = True
+        self.plot_item1.getViewBox().sigRangeChangedManually.connect(lambda: self.on_range_changed(1))
+        self.plot1_label1 = pg.TextItem("", color="b", anchor=(1, 0))
+        self.plot_item1.addItem(self.plot1_label1, ignoreBounds=True)
+        self.plot1_label2 = pg.TextItem("", color="r", anchor=(1, 0))
+        self.plot_item1.addItem(self.plot1_label2, ignoreBounds=True)
+        self.plot1_label2.hide()
+
         # Bottom plot (channel 2)
         self.plot_item2 = self.plot_widget.addPlot(row=1, col=0)
         self.plot_item2.setLabel("left", "Voltage (V)")
         self.plot_item2.setLabel("bottom", "Time (s)")
         self.plot_item2.showGrid(x=True, y=True)
+
+        self.plot2_auto_range = True
+        self.plot_item2.getViewBox().sigRangeChangedManually.connect(lambda: self.on_range_changed(2))
+        self.plot2_label2 = pg.TextItem("", color="r", anchor=(1, 0))
+        self.plot_item2.addItem(self.plot2_label2, ignoreBounds=True)
 
         # Disable all mouse interactions on both view boxes (pan/zoom/menus)
         for pi in (self.plot_item1, self.plot_item2):
@@ -819,20 +832,12 @@ class LMP91000UI(QWidget):
         self.combine = not self.combine
         if self.combine:
             self.combine_button.setText("Split")
-            # show both channels in the top plot and hide the bottom plot
-            try:
-                self.plot_item2.hide()
-            except Exception:
-                pass
-            # keep top plot showing both curves
-            self.plot_adc2.show()
+            self.plot_item2.hide()
+            self.plot1_label2.show()
         else:
             self.combine_button.setText("Combine")
-            try:
-                self.plot_item2.show()
-            except Exception:
-                pass
-            # clear the extra top trace for the separate mode (we"ll plot channel2 in bottom)
+            self.plot_item2.show()
+            self.plot1_label2.hide()
             self.plot_adc2.setData([])
 
     def on_active_toggled(self):
@@ -850,8 +855,14 @@ class LMP91000UI(QWidget):
         else:
             self.plot_item1.setYRange(ylim1[0], ylim1[1], padding=0)
             self.plot_item2.setYRange(ylim2[0], ylim2[1], padding=0)
-        self.plot_item1.enableAutoRange(axis="x")
-        self.plot_item2.enableAutoRange(axis="x")
+        self.plot1_auto_range = True
+        self.plot2_auto_range = True
+
+    def on_range_changed(self, idx):
+        if idx == 1:
+            self.plot1_auto_range = False
+        elif idx == 2:
+            self.plot2_auto_range = False
 
     def on_convert_toggled(self):
         self.convert = not self.convert
@@ -868,13 +879,41 @@ class LMP91000UI(QWidget):
 
     def update_plot(self):
         timestamp, v1, v2 = self.worker.get(self.convert, self.active)
+        if len(timestamp) == 0:
+            return
+        tmin = numpy.min(timestamp)
+        tmax = numpy.max(timestamp)
         
         if self.combine:
             self.plot_adc1.setData(timestamp, v1)
             self.plot_adc2.setData(timestamp, v2)
+            if self.plot1_auto_range:
+                self.plot_item1.setXRange(tmin, tmax, padding=0)
+
+            x_right = self.plot_item1.getViewBox().viewRange()[0][1]
+            y1_top = self.plot_item1.getViewBox().viewRange()[1][1]
+            self.plot1_label1.setText(f"1: {v1[-1]:.2f}")
+            self.plot1_label1.setPos(x_right, y1_top)
+            self.plot1_label2.setText(f"2: {v2[-1]:.2f}")
+            self.plot1_label2.setPos(x_right, y1_top)
         else:
             self.plot_adc1.setData(timestamp, v1)
             self.plot2_adc2.setData(timestamp, v2)
+            if self.plot1_auto_range:
+                self.plot_item1.setXRange(tmin, tmax, padding=0)
+            if self.plot2_auto_range:
+                self.plot_item2.setXRange(tmin, tmax, padding=0)
+
+            x_right1 = self.plot_item1.getViewBox().viewRange()[0][1]
+            y1_top = self.plot_item1.getViewBox().viewRange()[1][1]
+            y2_top = self.plot_item2.getViewBox().viewRange()[1][1]
+
+            self.plot1_label1.setText(f"1: {v1[-1]:.2f}")
+            self.plot1_label1.setPos(x_right1, y1_top)
+            
+            x_right2 = self.plot_item2.getViewBox().viewRange()[0][1]
+            self.plot2_label2.setText(f"2: {v2[-1]:.2f}")
+            self.plot2_label2.setPos(x_right2, y2_top)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -6,3 +6,4 @@
 src/__pycache__
 *.csv
 *.png
+test*/
