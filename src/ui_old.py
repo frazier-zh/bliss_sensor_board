@@ -6,20 +6,69 @@ import math
 import time
 import csv
 import numpy
+import threading
 from dataclasses import dataclass
 from functools import partial
+
+class deque:
+    def __init__(self, size, n_channels=1, dtype=float):
+        """
+        size: number of samples to store
+        n_channels: number of ADC channels (1 for single-channel)
+        """
+        self.size = size
+        self.n_channels = n_channels
+        self.buffer = numpy.zeros((size, n_channels), dtype=dtype)
+        self.timestamps = numpy.zeros(size)
+        self.head_index = 0  # Points to next write position
+        self.tail_index = 0  # Points to oldest element
+        self.count = 0       # Number of elements in buffer
+        self.lock = threading.Lock()
+
+    def append(self, value, timestamp):
+        """
+        value: single sample or array of shape (n_channels,)
+        timestamp: optional, defaults to current time
+        """
+        if timestamp is None:
+            timestamp = time.time()
+
+        with self.lock:
+            self.buffer[self.head_index] = value
+            self.timestamps[self.head_index] = timestamp
+            self.head_index = (self.head_index + 1) % self.size
+            
+            if self.count < self.size:
+                self.count += 1
+            else:
+                self.tail_index = (self.tail_index + 1) % self.size
+
+    def get(self):
+        """Return data in correct time order (oldest → newest)."""
+        with self.lock:
+            if self.count == 0:
+                return numpy.array([]), numpy.array([])
+            
+            indices = numpy.arange(self.tail_index, self.tail_index + self.count) % self.size
+            return self.timestamps[indices].copy(), self.buffer[indices].copy()
+    
+    def clear(self):
+        """Reset the deque to empty state."""
+        with self.lock:
+            self.head_index = 0
+            self.tail_index = 0
+            self.count = 0
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QTextEdit, QGridLayout,
-    QGroupBox, QFileDialog
+    QGroupBox, QFileDialog, QMessageBox
 )
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
 import pyqtgraph as pg
-from lib import deque
 
 ADC_SAMPLING_FREQ = 20
-BUFFER_LENGTH = 12 * 60 * 60 # (s)
+BUFFER_LENGTH = 4 * 60 * 60 # (s)
 ADC_RESOLUTION = 10
 ADC_N = (1 << ADC_RESOLUTION) - 1
 
@@ -29,7 +78,7 @@ ADC_VSTEP = ADC_VREF / ADC_N
 
 ADC_YMIN = -100
 ADC_YMAX = ADC_N + 100
-REFRESH_RATE = 60
+REFRESH_RATE = 30
 
 @dataclass
 class LMP91000REGS:
@@ -209,6 +258,15 @@ class LMP91000Settings:
         self.gain = self.tia_value[self.tia_gain]
         self.z = self.z_value[self.int_z]
 
+    def get_yrange(self):
+        ymin = LMP91000_VREF * (-self.z) / self.gain * 1e3
+        ymax = LMP91000_VREF * (1 - self.z) / self.gain * 1e3
+        return ymin, ymax
+    
+    def convert(self, x):
+        return ((x * ADC_VSTEP - LMP91000_VREF * self.z) / self.gain * 1e3) \
+            if self.active else 0  # uA
+
 class LMP91000SerialWorker(QThread):
     """
     Worker thread for serial I/O and simulation. Runs independently and emits signals
@@ -230,8 +288,7 @@ class LMP91000SerialWorker(QThread):
         self.buffer_length = buffer_length
 
         self.buffer = deque(self.buffer_length * self.adc_sampling_freq, n_channels=2)
-        self.active_buffer = deque(self.buffer_length * self.adc_sampling_freq, n_channels=2, dtype=bool)
-
+        
         self.current_time = 0
         self.simulate = False
         self.serial_port = None
@@ -297,8 +354,8 @@ class LMP91000SerialWorker(QThread):
             if match:
                 v1 = int(match.group(1))
                 v2 = int(match.group(2))
-                self.buffer.append([v1, v2], self.current_time)
-                self.active_buffer.append([self.c1_settings.active, self.c2_settings.active], self.current_time)
+                self.buffer.append(
+                    [self.c1_settings.convert(v1), self.c2_settings.convert(v2)], self.current_time)
             else:
                 # non-ADC lines go to log
                 self.log_message.emit(line)
@@ -337,8 +394,8 @@ class LMP91000SerialWorker(QThread):
         t = self.current_time
         v1 = 512 + 400 * math.sin(2 * math.pi * 1.0 * t) + 20 * math.sin(t * 10)
         v2 = 512 + 150 * math.cos(2 * math.pi * 0.5 * t) + 10 * math.cos(t * 7)
-        self.buffer.append([v1, v2], self.current_time)
-        self.active_buffer.append([True, True], self.current_time)
+        self.buffer.append(
+            [self.c1_settings.convert(v1), self.c2_settings.convert(v2)], self.current_time)
 
     def write_register(self, chip, settings, value):
         if not self.serial_port:
@@ -423,46 +480,14 @@ class LMP91000SerialWorker(QThread):
 
     def clear(self):
         self.buffer.clear()
-        self.active_buffer.clear()
 
-    def get(self, convert=False, active=False):
-        timestamp, value = self.buffer.get()
-        if len(timestamp) == 0:
-            return [], [], []
-        v1 = value[:, 0]
-        v2 = value[:, 1]
-
-        if convert:
-            z1 = LMP91000_VREF * self.c1_settings.z
-            z2 = LMP91000_VREF * self.c2_settings.z
-            v1 = (v1 * ADC_VSTEP - z1) / self.c1_settings.gain * 1e3  # uA
-            v2 = (v2 * ADC_VSTEP - z2) / self.c2_settings.gain * 1e3  # uA
-
-        if active:
-            _, active_value = self.active_buffer.get()
-            c1 = active_value[:, 0]
-            c2 = active_value[:, 1]
-            v1[~c1] = numpy.nan
-            v2[~c2] = numpy.nan
-
-        return timestamp, v1, v2
+    def get(self):
+        return self.buffer.get()
     
-    def get_axis_limit(self, convert=False):
-        if convert:
-            z1 = LMP91000_VREF * self.c1_settings.z
-            z2 = LMP91000_VREF * self.c2_settings.z
-            ymin1 = (-ADC_VREF * 0.05 - z1) / self.c1_settings.gain * 1e3  # uA
-            ymax1 = (ADC_VREF * 1.05 - z1) / self.c1_settings.gain * 1e3  # uA
-            ymin2 = (-ADC_VREF * 0.05 - z2) / self.c2_settings.gain * 1e3  # uA
-            ymax2 = (ADC_VREF * 1.05 - z2) / self.c2_settings.gain * 1e3  # uA
-        else:
-            ymin1 = ADC_YMIN
-            ymax1 = ADC_YMAX
-            ymin2 = ADC_YMIN
-            ymax2 = ADC_YMAX
+    def get_axis_limit(self):
         xmin = self.current_time - self.buffer_length
         xmax = self.current_time
-        return (xmin, xmax), (ymin1, ymax1), (ymin2, ymax2)
+        return (xmin, xmax), self.c1_settings.get_yrange(), self.c2_settings.get_yrange()
     
     def set_switch_settings(self, enabled, speed=1):
         self.switch = enabled
@@ -481,11 +506,8 @@ class LMP91000UI(QWidget):
         self.buffer_length = BUFFER_LENGTH # s
 
         # --- Controls ---
-        self.combine = False
-        self.convert = False
         self.switch = False
-        self.active = False
-        
+
         # --- Serial worker ---
         self.worker = LMP91000SerialWorker(self.adc_sampling_freq, self.buffer_length)
         
@@ -498,10 +520,20 @@ class LMP91000UI(QWidget):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        # --- Serial Controls ---
         serial_layout = QHBoxLayout()
         layout.addLayout(serial_layout)
 
+        chip_setting_layout = QHBoxLayout()
+        layout.addLayout(chip_setting_layout)
+        
+        readout_layout = QVBoxLayout()
+        layout.addLayout(readout_layout)
+
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 0)
+        layout.setStretch(2, 1)
+
+        # --- Serial Controls ---
         serial_port_group = QGroupBox("Serial Port")
         serial_port_layout = QVBoxLayout()
         serial_port_group.setLayout(serial_port_layout)
@@ -520,12 +552,10 @@ class LMP91000UI(QWidget):
         serial_port_layout.addWidget(self.connect_button)
         
         # --- Log Output ---
-        serial_log_group = QGroupBox("Log Output")
-        serial_layout.addWidget(serial_log_group)
         self.log_output = QTextEdit()
+        serial_layout.addWidget(self.log_output)
         self.log_output.setReadOnly(True)
-        serial_log_group.setLayout(QVBoxLayout())
-        serial_log_group.layout().addWidget(self.log_output)
+        self.log_output.setMaximumHeight(150)
 
         # --- Register Settings for Chip 1 & 2 ---
         @dataclass
@@ -541,9 +571,6 @@ class LMP91000UI(QWidget):
             bias_combo: QComboBox = None
             fet_short_combo: QComboBox = None
             op_mode_combo: QComboBox = None
-
-        chip_setting_layout = QHBoxLayout()
-        layout.addLayout(chip_setting_layout)
 
         self.c1_settings_ui = LMP91000SettingsUI(chip=1, group=QGroupBox("Chip 1"))
         self.c2_settings_ui = LMP91000SettingsUI(chip=2, group=QGroupBox("Chip 2"))
@@ -651,11 +678,6 @@ class LMP91000UI(QWidget):
         self.switch_enable_button.clicked.connect(self.on_switch_enable_toggled)
         
         # --- Plot ---
-        readout_group = QGroupBox("ADC Readout")
-        layout.addWidget(readout_group)
-        readout_layout = QVBoxLayout()
-        readout_group.setLayout(readout_layout)
-
         readout_button_layout = QHBoxLayout()
         readout_layout.addLayout(readout_button_layout)
 
@@ -671,21 +693,9 @@ class LMP91000UI(QWidget):
         self.save_image_button.clicked.connect(self.on_save_image_clicked)
         readout_button_layout.addWidget(self.save_image_button)
 
-        self.combine_button = QPushButton("Combine")
-        self.combine_button.clicked.connect(self.on_combine_toggled)
-        readout_button_layout.addWidget(self.combine_button)
-
-        self.active_button = QPushButton("Show Active")
-        self.active_button.clicked.connect(self.on_active_toggled)
-        readout_button_layout.addWidget(self.active_button)
-
         self.auto_button = QPushButton("Auto Scale")
         self.auto_button.clicked.connect(self.on_auto_clicked)
         readout_button_layout.addWidget(self.auto_button)
-
-        self.convert_button = QPushButton("Convert Current")
-        self.convert_button.clicked.connect(self.on_convert_toggled)
-        readout_button_layout.addWidget(self.convert_button)
 
         # --- Plotting Area with PyQtGraph (two PlotItems via GraphicsLayoutWidget) ---
         self.plot_widget = pg.GraphicsLayoutWidget()
@@ -694,40 +704,47 @@ class LMP91000UI(QWidget):
 
         # Top plot (channel 1 or combined)
         self.plot_item1 = self.plot_widget.addPlot(row=0, col=0)
-        self.plot_item1.setLabel("left", "Voltage (V)")
+        self.plot_item1.setLabel("left", "Current (uA)")
         self.plot_item1.setLabel("bottom", "Time (s)")
         self.plot_item1.showGrid(x=True, y=True)
-        self.plot_item1.addLegend()
+        self.plot_item1.getAxis("left").setWidth(50)
+        self.plot_item1.getAxis("right").setWidth(10)
 
-        self.plot1_auto_range = True
-        self.plot_item1.getViewBox().sigRangeChangedManually.connect(lambda: self.on_range_changed(1))
-        self.plot1_label1 = pg.TextItem("", color="b", anchor=(1, 0))
-        self.plot_item1.addItem(self.plot1_label1, ignoreBounds=True)
-        self.plot1_label2 = pg.TextItem("", color="r", anchor=(1, 0))
-        self.plot_item1.addItem(self.plot1_label2, ignoreBounds=True)
-        self.plot1_label2.hide()
+        self.auto_range = True
+        self.plot_item1.getViewBox().sigRangeChangedManually.connect(self.on_range_changed)
+        self.label1 = pg.LabelItem("", color="b")
+        self.label1.setFlag(self.label1.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.label1.setParentItem(self.plot_item1)
+        self.label1.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-40, 5))
+        self.arrow1 = pg.ArrowItem(angle=180, pen=pg.mkPen("k", width=1), brush=pg.mkBrush("b"))
+        self.plot_item1.addItem(self.arrow1)
 
         # Bottom plot (channel 2)
         self.plot_item2 = self.plot_widget.addPlot(row=1, col=0)
-        self.plot_item2.setLabel("left", "Voltage (V)")
+        self.plot_item2.setLabel("left", "Current (uA)")
         self.plot_item2.setLabel("bottom", "Time (s)")
         self.plot_item2.showGrid(x=True, y=True)
+        self.plot_item2.getAxis("left").setWidth(50)
+        self.plot_item2.getAxis("right").setWidth(10)
 
-        self.plot2_auto_range = True
-        self.plot_item2.getViewBox().sigRangeChangedManually.connect(lambda: self.on_range_changed(2))
-        self.plot2_label2 = pg.TextItem("", color="r", anchor=(1, 0))
-        self.plot_item2.addItem(self.plot2_label2, ignoreBounds=True)
+        self.plot_item2.getViewBox().linkView(pg.ViewBox.XAxis, self.plot_item1.getViewBox())
+
+        self.plot_item2.getViewBox().sigRangeChangedManually.connect(self.on_range_changed)
+        self.label2 = pg.LabelItem("", color="r")
+        self.label2.setFlag(self.label2.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.label2.setParentItem(self.plot_item2)
+        self.label2.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-40, 5))
+        self.arrow2 = pg.ArrowItem(angle=180, pen=pg.mkPen("k", width=1), brush=pg.mkBrush("r"))
+        self.plot_item2.addItem(self.arrow2)
 
         # Disable all mouse interactions on both view boxes (pan/zoom/menus)
         for pi in (self.plot_item1, self.plot_item2):
             vb = pi.getViewBox()
-            #vb.setMouseEnabled(x=False, y=True)
             vb.setMenuEnabled(False)
 
         # plot curves: separate curve per plot item
-        self.plot_adc1 = self.plot_item1.plot([], [], pen=pg.mkPen("b", width=2), name='Chip 1')
-        self.plot_adc2 = self.plot_item1.plot([], [], pen=pg.mkPen("r", width=2), name="Chip 2")
-        self.plot2_adc2 = self.plot_item2.plot([], [], pen=pg.mkPen("r", width=2), name="Chip 2")
+        self.data1 = self.plot_item1.plot([], [], pen=pg.mkPen("b", width=2), name='Chip 1')
+        self.data2 = self.plot_item2.plot([], [], pen=pg.mkPen("r", width=2), name="Chip 2")
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_plot)
@@ -805,19 +822,29 @@ class LMP91000UI(QWidget):
             self.log_output.append("Disabled auto switching.")
 
     def on_clear_clicked(self):
-        self.worker.clear()
-        self.log_output.append("Buffer cleared.")
+        reply = QMessageBox.warning(
+            self,
+            "Confirm Action",
+            "Proceed to clear all the buffered data?",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel
+        )
+        if reply == QMessageBox.Ok:
+            self.worker.clear()
+            self.log_output.append("Buffer cleared.")
+        else:
+            self.log_output.append("Cancelled buffer clearing.")
 
     def on_save_clicked(self):
-        t, v1, v2 = self.worker.get(self.convert, self.active) # Save all data
+        timestamp, value = self.worker.get() # Save all data
         fname, _ = QFileDialog.getSaveFileName(self, "Save Data", "adc_data.csv", "CSV Files (*.csv)")
         if not fname:
             return
         with open(fname, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(["t", "adc1", "adc2"])
-            for i in range(len(t)):
-                writer.writerow([t[i], v1[i], v2[i]])
+            for i in range(len(timestamp)):
+                writer.writerow([timestamp[i], value[i, 0], value[i, 1]])
         self.log_output.append(f"Data saved to {fname}")
 
     def on_save_image_clicked(self):
@@ -828,92 +855,37 @@ class LMP91000UI(QWidget):
         pix.save(fname)
         self.log_output.append(f"Image saved to {fname}")
 
-    def on_combine_toggled(self):
-        self.combine = not self.combine
-        if self.combine:
-            self.combine_button.setText("Split")
-            self.plot_item2.hide()
-            self.plot1_label2.show()
-        else:
-            self.combine_button.setText("Combine")
-            self.plot_item2.show()
-            self.plot1_label2.hide()
-            self.plot_adc2.setData([])
-
-    def on_active_toggled(self):
-        self.active = not self.active
-
-        if self.active:
-            self.active_button.setText("Show All")
-        else:
-            self.active_button.setText("Show Active")
-
     def on_auto_clicked(self):
-        _, ylim1, ylim2 = self.worker.get_axis_limit(self.convert)
-        if self.combine:
-            self.plot_item1.setYRange(min(ylim1[0], ylim2[0]), max(ylim1[1], ylim2[1]), padding=0)
-        else:
-            self.plot_item1.setYRange(ylim1[0], ylim1[1], padding=0)
-            self.plot_item2.setYRange(ylim2[0], ylim2[1], padding=0)
-        self.plot1_auto_range = True
-        self.plot2_auto_range = True
+        _, ylim1, ylim2 = self.worker.get_axis_limit()
+        self.plot_item1.setYRange(ylim1[0], ylim1[1], padding=0)
+        self.plot_item2.setYRange(ylim2[0], ylim2[1], padding=0)
+        self.auto_range = True
 
-    def on_range_changed(self, idx):
-        if idx == 1:
-            self.plot1_auto_range = False
-        elif idx == 2:
-            self.plot2_auto_range = False
-
-    def on_convert_toggled(self):
-        self.convert = not self.convert
-        if self.convert:
-            self.convert_button.setText("Show Actual")
-            self.plot_item1.setLabel("left", "Current (uA)")
-            self.plot_item2.setLabel("left", "Current (uA)")
-        else:
-            self.convert_button.setText("Show Current")
-            self.plot_item1.setLabel("left", "ADC Value")
-            self.plot_item2.setLabel("left", "ADC Value")
-        
-        self.auto_button.click()
+    def on_range_changed(self):
+        self.auto_range = False
 
     def update_plot(self):
-        timestamp, v1, v2 = self.worker.get(self.convert, self.active)
+        timestamp, value = self.worker.get()
         if len(timestamp) == 0:
             return
+        v1 = value[:, 0]
+        v2 = value[:, 1]
         tmin = numpy.min(timestamp)
         tmax = numpy.max(timestamp)
         
-        if self.combine:
-            self.plot_adc1.setData(timestamp, v1)
-            self.plot_adc2.setData(timestamp, v2)
-            if self.plot1_auto_range:
-                self.plot_item1.setXRange(tmin, tmax, padding=0)
+        self.data1.setData(timestamp, v1)
+        self.data2.setData(timestamp, v2)
+        if self.auto_range:
+            self.plot_item1.setXRange(tmin, tmax, padding=0)
 
-            x_right = self.plot_item1.getViewBox().viewRange()[0][1]
-            y1_top = self.plot_item1.getViewBox().viewRange()[1][1]
-            self.plot1_label1.setText(f"1: {v1[-1]:.2f}")
-            self.plot1_label1.setPos(x_right, y1_top)
-            self.plot1_label2.setText(f"2: {v2[-1]:.2f}")
-            self.plot1_label2.setPos(x_right, y1_top)
-        else:
-            self.plot_adc1.setData(timestamp, v1)
-            self.plot2_adc2.setData(timestamp, v2)
-            if self.plot1_auto_range:
-                self.plot_item1.setXRange(tmin, tmax, padding=0)
-            if self.plot2_auto_range:
-                self.plot_item2.setXRange(tmin, tmax, padding=0)
+        x_right1 = self.plot_item1.getViewBox().viewRange()[0][1]
 
-            x_right1 = self.plot_item1.getViewBox().viewRange()[0][1]
-            y1_top = self.plot_item1.getViewBox().viewRange()[1][1]
-            y2_top = self.plot_item2.getViewBox().viewRange()[1][1]
-
-            self.plot1_label1.setText(f"1: {v1[-1]:.2f}")
-            self.plot1_label1.setPos(x_right1, y1_top)
-            
-            x_right2 = self.plot_item2.getViewBox().viewRange()[0][1]
-            self.plot2_label2.setText(f"2: {v2[-1]:.2f}")
-            self.plot2_label2.setPos(x_right2, y2_top)
+        self.label1.setText(f"1: {v1[-1]:.2f}")
+        self.arrow1.setPos(x_right1, v1[-1])
+        
+        x_right2 = self.plot_item2.getViewBox().viewRange()[0][1]
+        self.label2.setText(f"2: {v2[-1]:.2f}")
+        self.arrow2.setPos(x_right2, v2[-1])
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
