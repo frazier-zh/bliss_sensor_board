@@ -64,6 +64,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QTextEdit, QGridLayout,
     QGroupBox, QFileDialog, QMessageBox
 )
+from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
 import pyqtgraph as pg
 
@@ -887,8 +888,20 @@ class LMP91000UI(QWidget):
         self.label2.setText(f"2: {v2[-1]:.2f}")
         self.arrow2.setPos(x_right2, v2[-1])
 
+import os
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    icon_path = resource_path(os.path.join("assets", "pcb_board.png"))
+    app.setWindowIcon(QIcon(icon_path))
     gui = LMP91000UI()
     gui.show()
     sys.exit(app.exec_())
