@@ -3,10 +3,16 @@
 #include <TimerOne.h>
 
 // Device addresses
-#define ADC1_PIN 6
-#define ADC2_PIN 10
-#define MENB1_PIN 12
-#define MENB2_PIN 5
+#define ADC1_PIN 8  // 28
+#define ADC2_PIN 10 // 30
+#define ADC3_PIN 4  // 25
+#define ADC4_PIN A0  // 36
+
+#define MENB1_PIN 9  // 29
+#define MENB2_PIN 13 // 32
+#define MENB3_PIN 6  // 27
+
+#define LED1 A2 // 38
 
 // LMP91000 registers
 #define LMP91000_ADDR 0b1001000
@@ -18,9 +24,11 @@
 
 // ADC
 #define ADC_SAMPLE_RATE_HZ 20
-#define ADC_BUFFER_SIZE 256
+#define ADC_BUFFER_SIZE 32
 volatile uint16_t adcBuffer1[ADC_BUFFER_SIZE];
 volatile uint16_t adcBuffer2[ADC_BUFFER_SIZE];
+volatile uint16_t adcBuffer3[ADC_BUFFER_SIZE];
+volatile uint16_t adcBuffer4[ADC_BUFFER_SIZE];
 volatile uint16_t adcHead = 0;
 volatile uint16_t adcTail = 0;
 
@@ -45,11 +53,13 @@ void setup() {
 
   pinMode(MENB1_PIN, OUTPUT);
   pinMode(MENB2_PIN, OUTPUT);
-  pinMode(ADC1_PIN, INPUT);
-  pinMode(ADC2_PIN, INPUT);
+  pinMode(MENB3_PIN, OUTPUT);
+  pinMode(LED1, OUTPUT);
+  digitalWrite(LED1, HIGH);
 
   LMP91000Configure(MENB1_PIN);
   LMP91000Configure(MENB2_PIN);
+  LMP91000Configure(MENB3_PIN);
 
   // Setup Timer1 for ADC sampling
   Timer1.initialize(1000000UL / ADC_SAMPLE_RATE_HZ); // Set period in microseconds
@@ -68,24 +78,34 @@ void loop() {
     noInterrupts(); 
     uint16_t value1 = adcBuffer1[adcTail];
     uint16_t value2 = adcBuffer2[adcTail];
+    uint16_t value3 = adcBuffer3[adcTail];
+    uint16_t value4 = adcBuffer4[adcTail];
     adcTail = (adcTail + 1) % ADC_BUFFER_SIZE;
     interrupts();
 
     Serial.print("ADC ");
     Serial.print(value1);
     Serial.print(" ");
-    Serial.println(value2);
+    Serial.print(value2);
+    Serial.print(" ");
+    Serial.print(value3);
+    Serial.print(" ");
+    Serial.println(value4);
   }
 }
 
 void onADCTimer() {
   uint16_t value1 = analogRead(ADC1_PIN);
   uint16_t value2 = analogRead(ADC2_PIN);
+  uint16_t value3 = analogRead(ADC3_PIN);
+  uint16_t value4 = analogRead(ADC4_PIN);
 
   uint16_t next = (adcHead + 1) % ADC_BUFFER_SIZE;
   if (next != adcTail) { // Check for buffer overflow
     adcBuffer1[next] = value1;
     adcBuffer2[next] = value2;
+    adcBuffer3[next] = value3;
+    adcBuffer4[next] = value4;
     adcHead = next;
   }
 }
