@@ -56,8 +56,14 @@ PLOT_AXIS_STYLE = {
     "bottom": {
         "style": { "showValues": False,},
     },
-    "left": { "width": 50,},
-    "right": { "width": 10,},
+    "left": {
+        "width": 20,
+        "style": { "showValues": False,},
+    },
+    "right": {
+        "width": 40,
+        "style": { "showValues": True,},
+    },
 }
 MASTER_PLOT_HEIGHT = 60
 MASTER_AXIS_STYLE = {
@@ -303,9 +309,10 @@ class BLISSUI(QWidget):
         layout.setColumnStretch(1, 0)
 
         # --- Master plot ---
-        self.alive = True
-        self.alive_size = DEFAULT_SIZE
-        self.alive_offset = 0
+        self.live = True
+        self.plot_update = True
+        self.live_size = DEFAULT_SIZE
+        self.live_offset = 0
         self.master_plot = MasterPlot(
             n_channels=self.n_channels,
             min_size=MASTER_MIN_SIZE,
@@ -323,6 +330,7 @@ class BLISSUI(QWidget):
         self.plots = [Plot(color=COLORS[i], linewidth=LINEWIDTH, color2=SECONDARY_COLOR) for i in range(self.n_channels)]
         self.plot_max_points = PLOT_MAX_POINTS
         self.mouse_pos = QPointF(0, 0)
+        self.mouse_update = True
         for i in range(self.n_channels):
             layout.addWidget(self.plots[i], i+1, 0)
             self.plots[i].setBackground(BACKGROUD_COLOR)
@@ -374,10 +382,10 @@ class BLISSUI(QWidget):
         self.auto_button.clicked.connect(self.on_auto_clicked)
         plot_control_layout.addWidget(self.auto_button)
 
-        self.alive_button = QPushButton("Show Live")
-        # alive option is globally synced by alive_button and master_plot
-        self.alive_button.clicked.connect(self.on_alive_clicked)
-        plot_control_layout.addWidget(self.alive_button)
+        self.live_button = QPushButton("Show Live")
+        # live option is globally synced by live_button and master_plot
+        self.live_button.clicked.connect(self.on_live_clicked)
+        plot_control_layout.addWidget(self.live_button)
 
         # --- Register settings ---
         self.setting_groups = [SettingGroup(f"Channel {i+1}", self.settings[i]) for i in range(self.n_channels)]
@@ -423,7 +431,7 @@ class BLISSUI(QWidget):
             for setting in self.settings:
                 self.worker.write_serial.emit(setting.update_all())
             self.auto_button.click()
-            self.alive_button.click()
+            self.live_button.click()
 
     def on_worker_log_message(self, msg):
         """Slot: receive log message from worker and display in UI."""
@@ -461,51 +469,71 @@ class BLISSUI(QWidget):
         for i in range(self.n_channels):
             self.on_auto_yaxis(i)
 
-    def on_alive_clicked(self):
-        self.alive_size = self.master_plot.region_size
-        self.alive_offset = 0
-        self.alive = True
+    def on_live_clicked(self):
+        self.live_size = self.master_plot.region_size
+        self.live_offset = 0
+        self.live = True
 
     def on_region_changed(self, xmin, xmax):
         # Activates when user manually change the region
         # Live logic:
-        # - When graph is alive
-        # -- The new region contains the last point, the graph is alive
-        # -- The graph is not alive if otherwise
-        # - When graph is not alive, it stays to be not alive
-        self.alive_size = xmax - xmin
-        if self.alive:
+        # - When graph is live
+        # -- The new region contains the last point, the graph is live
+        # -- The graph is not live if otherwise
+        # - When graph is not live, it stays to be not live
+        self.live_size = xmax - xmin
+        if self.live:
             if self.master_plot.xmax < xmax and self.master_plot.xmax > xmin:
-                self.alive_offset = xmax - self.master_plot.xmax
-                self.alive = True
+                self.live_offset = xmax - self.master_plot.xmax
+                self.live = True
             else:
-                self.alive = False
+                self.live = False
         else:
-            self.alive = False
+            self.live = False
+        self.plot_update = True
 
     def on_plot_mouse_moved(self, pos):
         self.mouse_pos = pos
+        self.mouse_update = True
 
     def update(self):
-        if self.alive:
-            end = self.worker.current_time + self.alive_offset
-            start = end - self.alive_size
+        # update plot value
+        current = self.worker.current_time
+        if self.live:
+            # when view is live
+            end = current + self.live_offset
+            start = end - self.live_size
             self.master_plot.try_set_region(start, end)
+            timestamp, value = self.worker.get(start, end, max_points=self.plot_max_points)
+            if not len(timestamp) == 0:
+                for i in range(self.n_channels):
+                    self.plots[i].set_region(start, end)
+                    self.plots[i].set_data(timestamp, value[:, i])
         else:
+            # when view region has changed
             start, end = self.master_plot.get_region()
+            if self.plot_update or start < current < end:
+                timestamp, value = self.worker.get(start, end, max_points=self.plot_max_points)
+                if not len(timestamp) == 0:
+                    for i in range(self.n_channels):
+                        self.plots[i].set_region(start, end)
+                        self.plots[i].set_data(timestamp, value[:, i])
         
-        timestamp, value = self.worker.get(start, end, max_points=self.plot_max_points)
-        if not len(timestamp) == 0:
-            last = self.worker.at()
-            for i in range(self.n_channels):
-                self.plots[i].set_region(start, end)
-                self.plots[i].set_data(timestamp, value[:, i])
-                self.plots[i].set_last(last[i])
-            
+        # update last value
+        last = self.worker.at()
+        for i in range(self.n_channels):
+            self.plots[i].set_last(last[i])
+
+        # update mouse line
+        if self.mouse_update or self.plot_update or self.live:
             mouse_pos = self.plots[0].vb.mapSceneToView(self.mouse_pos)
             mouse_data = self.worker.at(mouse_pos.x())
             for i in range(self.n_channels):
                 self.plots[i].set_line(mouse_pos.x(), mouse_data[i])
+        
+        # reset update indicator
+        self.mouse_update = False
+        self.plot_update = False
 
     def update_master(self):
         timestamp, value = self.worker.get(max_points=self.master_max_points)

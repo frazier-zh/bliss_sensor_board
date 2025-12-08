@@ -54,14 +54,14 @@ class Plot(pg.PlotWidget):
         self.label = pg.LabelItem("", color=color)
         self.label.setFlag(self.arrow.GraphicsItemFlag.ItemIgnoresTransformations)
         self.label.setParentItem(self.plotItem)
-        self.label.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-20, 5))
+        self.label.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-50, 5))
 
         self.line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(color2, width=1))
         self.addItem(self.line, ignoreBounds=True)
         self.line_label = pg.LabelItem("", color=color)
         self.line_label.setFlag(self.arrow.GraphicsItemFlag.ItemIgnoresTransformations)
         self.line_label.setParentItem(self.plotItem)
-        self.line_label.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-20, 20))
+        self.line_label.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-50, 20))
 
     def set_data(self, x, y):
         self.data.setData(x, y)
@@ -181,8 +181,6 @@ class MasterPlot(pg.PlotWidget):
             self.showAxis(axis_name)
             axis_style = style[axis_name]
             axis = self.getAxis(axis_name)
-            if "show" in axis_style:
-                self.showAxis(axis_style["show"])
             if "style" in axis_style:
                 axis.setStyle(**axis_style["style"])
             if "width" in axis_style:
