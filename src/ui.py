@@ -522,14 +522,14 @@ class BLISSUI(QWidget):
         # update last value
         last = self.worker.at()
         for i in range(self.n_channels):
-            self.plots[i].set_last(last[i])
+            self.plots[i].set_last(last[i], f"X: {current:.1f}\nY: {last[i]:.2f}")
 
         # update mouse line
-        if self.mouse_update or self.plot_update or self.live:
-            mouse_pos = self.plots[0].vb.mapSceneToView(self.mouse_pos)
-            mouse_data = self.worker.at(mouse_pos.x())
-            for i in range(self.n_channels):
-                self.plots[i].set_line(mouse_pos.x(), mouse_data[i])
+        mouse_pos = self.plots[0].vb.mapSceneToView(self.mouse_pos)
+        x = mouse_pos.x()
+        mouse_data = self.worker.at(x)
+        for i in range(self.n_channels):
+            self.plots[i].set_line(x, f"X  : {x:.1f}\nΔX: {current-x:.1f}\nY  : {mouse_data[i]:.2f}")
         
         # reset update indicator
         self.mouse_update = False

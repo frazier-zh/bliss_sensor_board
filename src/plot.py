@@ -58,22 +58,19 @@ class Plot(pg.PlotWidget):
 
         self.line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(color2, width=1))
         self.addItem(self.line, ignoreBounds=True)
-        self.line_label = pg.LabelItem("", color=color)
-        self.line_label.setFlag(self.arrow.GraphicsItemFlag.ItemIgnoresTransformations)
-        self.line_label.setParentItem(self.plotItem)
-        self.line_label.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-50, 20))
+        self.line_label = pg.InfLineLabel(self.line, "", position=0.7)
 
     def set_data(self, x, y):
         self.data.setData(x, y)
 
-    def set_last(self, value):
+    def set_last(self, y, label: str):
         x_right = self.vb.viewRange()[0][1]
-        self.label.setText(f"Last:   {value:.2f}")
-        self.arrow.setPos(x_right, value)
+        self.arrow.setPos(x_right, y)
+        self.label.setText(label)
 
-    def set_line(self, x, value):
+    def set_line(self, x, label: str):
         self.line.setPos(x)
-        self.line_label.setText(f"Mouse:  {value:.2f}")
+        self.line_label.setText(label)
 
     def set_region(self, xmin, xmax):
         self.setXRange(xmin, xmax, padding=0)
