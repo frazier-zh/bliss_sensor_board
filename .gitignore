@@ -1,7 +1,6 @@
 .pio
 .vscode/
 src/__pycache__
-*.csv
 *.png
 test*/
 .venv/

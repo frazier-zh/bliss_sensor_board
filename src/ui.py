@@ -1,21 +1,12 @@
 """
-    Project: BLISS Sensor Test Board (Dual Channel)
-    Application: LMP91000 User Interface
-    
+    Project: BLISS
+    Application: BLISS Sensor Board User Interface
+    File: src/ui.py
+    Description: Main UI and logic.
+    Author: Fang Zihang (Dr.)
+    Email: fang.zh@nus.edu.sg
+    Affiliation: National University of Singapore
 """
-# --- CONSTANTS ---
-# * DO NOT CHANGE *
-ADC_SAMPLING_FREQ = 20
-BUFFER_LENGTH = 900  # (s)
-ADC_RESOLUTION = 10
-ADC_N = (1 << ADC_RESOLUTION) - 1
-LMP91000_VREF = 3.0
-ADC_VREF = 3.3
-ADC_VSTEP = ADC_VREF / ADC_N
-ADC_YMIN = -100
-ADC_YMAX = ADC_N + 100
-REFRESH_RATE = 60
-
 # --- Python packages ---
 import sys
 import serial
@@ -24,8 +15,6 @@ import re
 import math
 import time
 import csv
-import numpy
-from dataclasses import dataclass
 from functools import partial
 
 from PyQt5.QtWidgets import (
@@ -33,65 +22,128 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QTextEdit, QGridLayout,
     QGroupBox, QFileDialog
 )
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
+from PyQt5.QtGui import QPixmap, QPainter
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPointF
 import pyqtgraph as pg
 
-from lib import deque
+# --- CONSTANTS ---
+# * DO NOT CHANGE *
+ADC_SAMPLE_RATE = 20
+N_CHANNELS = 4
+
+# * OK TO CHANGE *
+DEFAULT_SIZE = 300  # 5 mins
+MEMORY_SIZE = 360000
+REFRESH_RATE = 30
+
+PLOT_MAX_POINTS = 6000
+MASTER_MAX_POINTS = 1024
+MASTER_MIN_SIZE = 10  # 10 seconds
+MASTER_MAX_SIZE = 1800 # 30 mins
+MASTER_REFRESH_RATE = 1
+
+#COLORS = ["r", "b", "g", "m"]
+COLORS = ["y", "c", "r", "g"]
+#BACKGROUD_COLOR = "w"
+BACKGROUD_COLOR = "k"
+#SECONDARY_COLOR = "k"
+SECONDARY_COLOR = "w"
+LINEWIDTH = 2
+PLOT_AXIS_STYLE = {
+    "top": {
+        "style": { "showValues": False,},
+    },
+    "bottom": {
+        "style": { "showValues": False,},
+    },
+    "left": { "width": 50,},
+    "right": { "width": 10,},
+}
+MASTER_PLOT_HEIGHT = 60
+MASTER_AXIS_STYLE = {
+    "top": {
+        "height": 10,
+        "style": { "showValues": False,},
+    },
+    "bottom": {
+        "height": 10,
+        "style": { "showValues": False,},
+    },
+    "left": {
+        "width": 150,
+        "style": { "showValues": False,},
+    },
+    "right": {
+        "width": 150,
+        "style": { "showValues": False,},
+    },
+}
+
+def combine_images_vertical(pixmaps):
+    total_height = sum(p.height() for p in pixmaps)
+    max_width = max(p.width() for p in pixmaps)
+
+    result = QPixmap(max_width, total_height)
+    result.fill(pg.mkColor(BACKGROUD_COLOR))
+    painter = QPainter(result)
+    y_offset = 0
+    for p in pixmaps:
+        painter.drawPixmap(0, y_offset, p)
+        y_offset += p.height()
+    painter.end()
+    return result
+
+# --- Local python packages ---
+from lib import storage
+from plot import Plot, MasterPlot
+from device import LMP91000, PHSensor
 
 # --- Serial worker ---
-class LMP91000SerialWorker(QThread):
+class SerialWorker(QThread):
     """
     Worker thread for serial I/O and simulation. Runs independently and emits signals
     to safely update the UI without blocking the main thread.
     """
-    # Signals: emit data and status updates safely to UI
     # Outbound signals
-    settings_changed = pyqtSignal()           # register settings changed
-    log_message = pyqtSignal(str)             # log string
-
+    log_message = pyqtSignal(str)           # Write to UI from serial
     # Inbound signals
-    ui_settings_changed = pyqtSignal(int, str, int)
-    
-    def __init__(self, adc_sampling_freq, buffer_length):
+    write_serial = pyqtSignal(str)          # Write to serial
+    clear_buffer = pyqtSignal()
+
+    def __init__(self, n_channels, channel_formulas):
         super().__init__()
-        self.adc_sampling_freq = adc_sampling_freq
-        self.adc_dt = 1.0 / self.adc_sampling_freq
+        self.n_channels = n_channels
+        self.channel_formulas = channel_formulas
+
+        self.ADC_SAMPLE_RATE = ADC_SAMPLE_RATE
+        self.adc_dt = 1.0 / self.ADC_SAMPLE_RATE
         self.adc_dt_half = self.adc_dt / 2
-        self.buffer_length = buffer_length
 
-        self.buffer = deque(self.buffer_length * self.adc_sampling_freq, n_channels=2)
-        self.active_buffer = deque(self.buffer_length * self.adc_sampling_freq, n_channels=2, dtype=bool)
+        self.serial_read_pattern = r"ADC" + r" (\d+)" * self.n_channels
 
+        self.memory_size = MEMORY_SIZE
+        self.memory = storage(n_channels=self.n_channels, size=self.memory_size)
+        self.get = self.memory.get
+        self.at = self.memory.at
+
+        self.start_time = 0
         self.current_time = 0
         self.simulate = False
         self.serial_port = None
         self.running = False
 
-        self.switch = False
-        self.last_switch_time = 0
-
-        self.c1_settings = LMP91000Settings(chip=1)
-        self.c2_settings = LMP91000Settings(chip=2)
-
-        # Connect inbound signals to methods
-        self.ui_settings_changed.connect(self.on_ui_settings_changed)
-
-    def on_ui_settings_changed(self, chip, key, value):
-        settings = self.c1_settings if chip == 1 else self.c2_settings
-        data = settings.update(key, value)
-        self.write_serial(data)
+        self.write_serial.connect(self.on_write_serial)
+        self.clear_buffer.connect(self.clear)
         
     def run(self):
         """Main thread loop: read serial or simulate data at sampling frequency."""
-        start_time = time.time()
+        self.start_time = time.time()
         while True:
+            self.current_time = time.time() - self.start_time
             if not self.running:
+                self.memory.append(0, self.current_time)
                 time.sleep(0.01)
                 continue
-            
-            self.current_time = time.time() - start_time
-            if self.switch:
-                self.switch_channel()
             if self.simulate:
                 self.simulate_data()
                 time.sleep(self.adc_dt)
@@ -99,7 +151,7 @@ class LMP91000SerialWorker(QThread):
                 self.read_serial()
                 time.sleep(self.adc_dt_half)
 
-    def write_serial(self, data: str):
+    def on_write_serial(self, data: str):
         if not self.serial_port:
             self.log_message.emit("Not connected.")
             return
@@ -114,44 +166,27 @@ class LMP91000SerialWorker(QThread):
             if not line:
                 return
             
-            match = re.search(r"ADC (\d+) (\d+)", line)
+            match = re.search(self.serial_read_pattern, line)
             if match:
-                v1 = int(match.group(1))
-                v2 = int(match.group(2))
-                self.buffer.append([v1, v2], self.current_time)
-                self.active_buffer.append([self.c1_settings.active, self.c2_settings.active], self.current_time)
+                v = [self.channel_formulas[i](int(match.group(i+1))) for i in range(self.n_channels)]
+                self.memory.append(v, self.current_time)
             else:
                 # non-ADC lines go to log
                 self.log_message.emit(line)
         except Exception as e:
             self.log_message.emit(f"Serial read error: {e}")
-
-    def switch_channel(self):
-        """Alternate reading between two chips."""
-        if self.current_time - self.last_switch_time < self.switch_speed:
-            return
-        self.last_switch_time = self.current_time
-        # Get previous op_mode settings
-        c1_mode = self.c1_settings.op_mode
-        c2_mode = self.c2_settings.op_mode
-
-        # Exchange new op_mode settings
-        self.write_serial(self.c1_settings.update("op_mode", 0))
-        self.write_serial(self.c2_settings.update("op_mode", 0))  # Turn off before switching
-        time.sleep(0.01)
-        self.write_serial(self.c1_settings.update("op_mode", c2_mode))
-        self.write_serial(self.c2_settings.update("op_mode", c1_mode))
-
-        # Emit UI update signal
-        self.settings_changed.emit()
     
     def simulate_data(self):
         """Generate simulated ADC data at the configured frequency."""
         t = self.current_time
-        v1 = 512 + 400 * math.sin(2 * math.pi * 1.0 * t) + 20 * math.sin(t * 10)
-        v2 = 512 + 150 * math.cos(2 * math.pi * 0.5 * t) + 10 * math.cos(t * 7)
-        self.buffer.append([v1, v2], self.current_time)
-        self.active_buffer.append([True, True], self.current_time)
+        raw_data = [
+            500 + 400 * math.sin(2 * math.pi * 1.0 * t) + 20 * math.sin(t * 10),
+            500 + 150 * math.cos(2 * math.pi * 0.5 * t) + 10 * math.cos(t * 7),
+            500 + 250 * math.copysign(1, math.cos(2 * math.pi * 0.2 * t)),
+            500 + 200 * math.copysign(1, math.cos(2 * math.pi * 0.2 * (t + 2))),
+        ]
+        v = [self.channel_formulas[i](raw_data[i]) for i in range(self.n_channels)]
+        self.memory.append(v, self.current_time)
 
     def refresh_port(self):
         port_list = []
@@ -164,16 +199,17 @@ class LMP91000SerialWorker(QThread):
     
     def disconnect(self):
         """Stop the worker thread gracefully."""
-        if self.running:
-            self.running = False
-            self.simulate = False
-            if self.serial_port:
-                try:
-                    self.serial_port.close()
-                except Exception:
-                    self.log_message.emit("Port already disconnected.")
-                    pass
-            self.log_message.emit("Stopped.")
+        if not self.running:
+            return
+        self.running = False
+        self.simulate = False
+        if self.serial_port:
+            try:
+                self.serial_port.close()
+            except Exception:
+                self.log_message.emit("Port already disconnected.")
+                pass
+        self.log_message.emit("Stopped.")
 
     def connect(self, serial_port):
         if serial_port == "SIMULATE":
@@ -181,112 +217,127 @@ class LMP91000SerialWorker(QThread):
             self.running = True
             self.simulate = True
             self.log_message.emit("Simulation started.")
-        else:
-            # Try to connect to serial port
-            try:
-                self.serial_port = serial.Serial(serial_port, baudrate=115200, timeout=1)
-                self.running = True
-                self.simulate = False
-                self.log_message.emit(f"Connected to {serial_port}.")
-                time.sleep(0.01)
-                self.write_serial(self.c1_settings.update_all())
-                self.write_serial(self.c2_settings.update_all())
-            except Exception as e:
-                self.serial_port = None
-                self.log_message.emit(f"Error connecting: {e}")
+            return
+        # Try to connect to serial port
+        try:
+            self.serial_port = serial.Serial(serial_port, baudrate=115200, timeout=1)
+            self.running = True
+            self.simulate = False
+            self.log_message.emit(f"Connected to {serial_port}.")
+            time.sleep(0.01)
+        except Exception as e:
+            self.serial_port = None
+            self.log_message.emit(f"Error connecting: {e}")
     
     def is_running(self):
         return self.running
 
     def clear(self):
-        self.buffer.clear()
-        self.active_buffer.clear()
+        self.memory.clear()
+        self.start_time = time.time()
+        self.current_time = 0
 
-    def get(self, convert=False, active=False):
-        timestamp, value = self.buffer.get()
-        if len(timestamp) == 0:
-            return [], [], []
-        v1 = value[:, 0]
-        v2 = value[:, 1]
+class SettingGroup(QGroupBox):
+    # Helper class for auto-generating Qgroup with QComboBox
+    # For sensor configuration
+    write_serial = pyqtSignal(str)
+    auto_yrange = pyqtSignal()
 
-        if convert:
-            z1 = LMP91000_VREF * self.c1_settings.z
-            z2 = LMP91000_VREF * self.c2_settings.z
-            v1 = (v1 * ADC_VSTEP - z1) / self.c1_settings.gain * 1e3  # uA
-            v2 = (v2 * ADC_VSTEP - z2) / self.c2_settings.gain * 1e3  # uA
+    def __init__(self, name, setting):
+        super().__init__(name)
+        layout = QGridLayout()
+        self.setLayout(layout)
+        self.setting = setting
 
-        if active:
-            _, active_value = self.active_buffer.get()
-            c1 = active_value[:, 0]
-            c2 = active_value[:, 1]
-            v1[~c1] = numpy.nan
-            v2[~c2] = numpy.nan
+        if not hasattr(setting, "active_keys"):
+            return
+        
+        def func(key, idx):
+            self.write_serial.emit(self.setting.update(key, idx))
+            self.auto_yrange.emit()
 
-        return timestamp, v1, v2
-    
-    def get_axis_limit(self, convert=False):
-        if convert:
-            z1 = LMP91000_VREF * self.c1_settings.z
-            z2 = LMP91000_VREF * self.c2_settings.z
-            ymin1 = (-ADC_VREF * 0.05 - z1) / self.c1_settings.gain * 1e3  # uA
-            ymax1 = (ADC_VREF * 1.05 - z1) / self.c1_settings.gain * 1e3  # uA
-            ymin2 = (-ADC_VREF * 0.05 - z2) / self.c2_settings.gain * 1e3  # uA
-            ymax2 = (ADC_VREF * 1.05 - z2) / self.c2_settings.gain * 1e3  # uA
-        else:
-            ymin1 = ADC_YMIN
-            ymax1 = ADC_YMAX
-            ymin2 = ADC_YMIN
-            ymax2 = ADC_YMAX
-        xmin = self.current_time - self.buffer_length
-        xmax = self.current_time
-        return (xmin, xmax), (ymin1, ymax1), (ymin2, ymax2)
-    
-    def set_switch_settings(self, enabled, speed=1):
-        self.switch = enabled
-        self.switch_speed = speed
+        row = 0
+        for key in self.setting.active_keys:
+            label_str = getattr(self.setting, key + "_label")
+            layout.addWidget(QLabel(label_str + ":"), row, 0)
+            combo = QComboBox()
+            layout.addWidget(combo, row, 1)
+            
+            combo.addItems(getattr(self.setting, key + "_text"))
+            combo.setCurrentIndex(getattr(self.setting, key))
+            combo.currentIndexChanged.connect(partial(func, key))
+            row = row + 1
 
-class LMP91000UI(QWidget):
+class BLISSUI(QWidget):
     # Signals: emit data and status updates safely to UI
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LMP91000 UI")
-        self.resize(800, 1000)
+        self.setWindowTitle("BLISS Sensor Interface")
+        self.resize(1200, 800)
         
-        # --- Buffer and state (UI-side) ---
-        self.adc_sampling_freq = ADC_SAMPLING_FREQ # Hz
-        self.dt = 1.0 / self.adc_sampling_freq
-        self.buffer_length = BUFFER_LENGTH # s
-
-        # --- Controls ---
-        self.combine = False
-        self.convert = False
-        self.switch = False
-        self.active = False
+        # --- Settings ---
+        self.n_channels = N_CHANNELS
+        self.settings = [LMP91000(id=i+1) for i in range(3)] + [PHSensor(id=4)]
         
         # --- Serial worker ---
-        self.worker = LMP91000SerialWorker(self.adc_sampling_freq, self.buffer_length)
-        
-        self.worker.settings_changed.connect(self.on_worker_settings_changed)
+        self.worker = SerialWorker(self.n_channels, [settings.formula for settings in self.settings])
         self.worker.log_message.connect(self.on_worker_log_message)
-       
         self.worker.start()
 
         # --- Layouts ---
-        layout = QVBoxLayout()
+        layout = QGridLayout()
         self.setLayout(layout)
-
-        # --- Serial Controls ---
-        serial_layout = QHBoxLayout()
-        layout.addLayout(serial_layout)
-
+        layout.setVerticalSpacing(0)
+        
+        plot_layout = QVBoxLayout()
+        plot_layout.setSpacing(0)
+        layout.addLayout(plot_layout, 0, 0)
+        
         serial_port_group = QGroupBox("Serial Port")
+        layout.addWidget(serial_port_group, 0, 1,)
+
+        self.log_output = QTextEdit()
+        layout.addWidget(self.log_output, self.n_channels+1, 0, 1, 2)
+
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 0)
+
+        # --- Master plot ---
+        self.alive = True
+        self.alive_size = DEFAULT_SIZE
+        self.alive_offset = 0
+        self.master_plot = MasterPlot(
+            n_channels=self.n_channels,
+            min_size=MASTER_MIN_SIZE,
+            max_size=MASTER_MAX_SIZE,
+            colors=COLORS,
+            color2=SECONDARY_COLOR,
+        )
+        self.master_plot.setBackground(BACKGROUD_COLOR)
+        self.master_plot.setFixedHeight(MASTER_PLOT_HEIGHT)
+        self.master_plot.set_axis_style(MASTER_AXIS_STYLE)
+        self.master_max_points = MASTER_MAX_POINTS
+        self.master_plot.region_changed.connect(self.on_region_changed)
+
+        # --- Plot item ---
+        self.plots = [Plot(color=COLORS[i], linewidth=LINEWIDTH, color2=SECONDARY_COLOR) for i in range(self.n_channels)]
+        self.plot_max_points = PLOT_MAX_POINTS
+        self.mouse_pos = QPointF(0, 0)
+        for i in range(self.n_channels):
+            layout.addWidget(self.plots[i], i+1, 0)
+            self.plots[i].setBackground(BACKGROUD_COLOR)
+            self.plots[i].set_axis_style(PLOT_AXIS_STYLE)
+            self.plots[i].showGrid(x=True, y=True, alpha=0.2)
+            self.plots[i].scene().sigMouseMoved.connect(self.on_plot_mouse_moved)
+        self.plots[-1].getAxis("bottom").setStyle(showValues=True)
+        self.plots[-1].setLabel("bottom", "Time (s)")
+        
+        # --- Serial controls ---
         serial_port_layout = QVBoxLayout()
         serial_port_group.setLayout(serial_port_layout)
 
-        serial_layout.addWidget(serial_port_group)
         self.port_combo = QComboBox()
         serial_port_layout.addWidget(self.port_combo)
-        # always allow a simulation port for testing
 
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.on_refresh_clicked)
@@ -296,212 +347,56 @@ class LMP91000UI(QWidget):
         self.connect_button.clicked.connect(self.on_connect_toggled)
         serial_port_layout.addWidget(self.connect_button)
         
-        # --- Log Output ---
-        serial_log_group = QGroupBox("Log Output")
-        serial_layout.addWidget(serial_log_group)
-        self.log_output = QTextEdit()
+        # --- Log output ---
         self.log_output.setReadOnly(True)
-        serial_log_group.setLayout(QVBoxLayout())
-        serial_log_group.layout().addWidget(self.log_output)
-
-        # --- Register Settings for Chip 1 & 2 ---
-        @dataclass
-        class LMP91000SettingsUI:
-            # UI elements
-            chip: int = 0
-            group: QGroupBox = None
-            tia_gain_combo: QComboBox = None
-            rload_combo: QComboBox = None
-            ref_source_combo: QComboBox = None
-            int_z_combo: QComboBox = None
-            bias_sign_combo: QComboBox = None
-            bias_combo: QComboBox = None
-            fet_short_combo: QComboBox = None
-            op_mode_combo: QComboBox = None
-
-        chip_setting_layout = QHBoxLayout()
-        layout.addLayout(chip_setting_layout)
-
-        self.c1_settings_ui = LMP91000SettingsUI(chip=1, group=QGroupBox("Chip 1"))
-        self.c2_settings_ui = LMP91000SettingsUI(chip=2, group=QGroupBox("Chip 2"))
+        self.log_output.setMaximumHeight(180)
         
-        for settings_ui, settings in [
-            (self.c1_settings_ui, self.worker.c1_settings),
-            (self.c2_settings_ui, self.worker.c2_settings)]:
-            chip_setting_layout.addWidget(settings_ui.group)
-            settings_layout = QHBoxLayout()
-            settings_ui.group.setLayout(settings_layout)
-
-            TIACN_group = QGroupBox("TIA")
-            TIACN_layout = QGridLayout()
-            TIACN_group.setLayout(TIACN_layout)
-            settings_layout.addWidget(TIACN_group)
-
-            settings_ui.tia_gain_combo = QComboBox()
-            TIACN_layout.addWidget(QLabel("TIA gain:"), 0, 0)
-            TIACN_layout.addWidget(settings_ui.tia_gain_combo, 1, 0)
-            settings_ui.tia_gain_combo.addItems(settings.get_all("tia_gain"))
-            settings_ui.tia_gain_combo.setCurrentIndex(settings.tia_gain)
-            settings_ui.tia_gain_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "tia_gain"))
-
-            settings_ui.rload_combo = QComboBox()
-            TIACN_layout.addWidget(QLabel("R_load:"), 2, 0)
-            TIACN_layout.addWidget(settings_ui.rload_combo, 3, 0)
-            settings_ui.rload_combo.addItems(settings.get_all("rload"))
-            settings_ui.rload_combo.setCurrentIndex(settings.rload)
-            settings_ui.rload_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "rload"))
-
-            REFCN_group = QGroupBox("Reference")
-            REFCN_layout = QGridLayout()
-            REFCN_group.setLayout(REFCN_layout)
-            settings_layout.addWidget(REFCN_group)
-
-            settings_ui.ref_source_combo = QComboBox()
-            REFCN_layout.addWidget(QLabel("Reference:"), 0, 0)
-            REFCN_layout.addWidget(settings_ui.ref_source_combo, 0, 1)
-            settings_ui.ref_source_combo.addItems(settings.get_all("ref_source"))
-            settings_ui.ref_source_combo.setCurrentIndex(settings.ref_source)
-            settings_ui.ref_source_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "ref_source"))
-
-            settings_ui.int_z_combo = QComboBox()
-            REFCN_layout.addWidget(QLabel("Internal zero:"), 1, 0)
-            REFCN_layout.addWidget(settings_ui.int_z_combo, 1, 1)
-            settings_ui.int_z_combo.addItems(settings.get_all("int_z"))
-            settings_ui.int_z_combo.setCurrentIndex(settings.int_z)
-            settings_ui.int_z_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "int_z"))
-
-            settings_ui.bias_sign_combo = QComboBox()
-            REFCN_layout.addWidget(QLabel("Bias polarity:"), 2, 0)
-            REFCN_layout.addWidget(settings_ui.bias_sign_combo, 2, 1)
-            settings_ui.bias_sign_combo.addItems(settings.get_all("bias_sign"))
-            settings_ui.bias_sign_combo.setCurrentIndex(settings.bias_sign)
-            settings_ui.bias_sign_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "bias_sign"))
-
-            settings_ui.bias_combo = QComboBox()
-            REFCN_layout.addWidget(QLabel("Bias level:"), 3, 0)
-            REFCN_layout.addWidget(settings_ui.bias_combo, 3, 1)
-            settings_ui.bias_combo.addItems(settings.get_all("bias"))
-            settings_ui.bias_combo.setCurrentIndex(settings.bias)
-            settings_ui.bias_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "bias"))
-
-            MODECN_group = QGroupBox("Mode")
-            MODECN_layout = QGridLayout()
-            MODECN_group.setLayout(MODECN_layout)
-            settings_layout.addWidget(MODECN_group)
-
-            settings_ui.fet_short_combo = QComboBox()
-            MODECN_layout.addWidget(QLabel("FET short:"), 0, 0)
-            MODECN_layout.addWidget(settings_ui.fet_short_combo, 1, 0)
-            settings_ui.fet_short_combo.addItems(settings.get_all("fet_short"))
-            settings_ui.fet_short_combo.setCurrentIndex(settings.fet_short)
-            settings_ui.fet_short_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "fet_short"))
-
-            settings_ui.op_mode_combo = QComboBox()
-            MODECN_layout.addWidget(QLabel("Operating mode:"), 2, 0)
-            MODECN_layout.addWidget(settings_ui.op_mode_combo, 3, 0)
-            settings_ui.op_mode_combo.addItems(settings.get_all("op_mode"))
-            settings_ui.op_mode_combo.setCurrentIndex(settings.op_mode)
-            settings_ui.op_mode_combo.currentIndexChanged.connect(
-                partial(self.worker.ui_settings_changed.emit, settings_ui.chip, "op_mode"))
-
-        # --- Auto mode control ---
-        switch_group = QGroupBox("Auto Switching")
-        switch_layout = QVBoxLayout()
-        switch_layout.setAlignment(Qt.AlignTop)
-        switch_group.setLayout(switch_layout)
-        self.c2_settings_ui.group.layout().addWidget(switch_group) # Add two chip-2 panel
-
-        switch_layout.addWidget(QLabel("Speed (s):"))
-        self.switch_speed_combo = QComboBox()
-        self.switch_speed_combo.addItems(["0.5", "1", "5", "10", "30", "60", "120", "300"])
-        self.switch_speed_combo.setCurrentText("1")
-        switch_layout.addWidget(self.switch_speed_combo)
-        self.switch_speed_combo.currentIndexChanged.connect(self.on_switch_speed_changed)
-
-        self.switch_enable_button = QPushButton("Enable")
-        switch_layout.addWidget(self.switch_enable_button)
-        self.switch_enable_button.clicked.connect(self.on_switch_enable_toggled)
-        
-        # --- Plot ---
-        readout_group = QGroupBox("ADC Readout")
-        layout.addWidget(readout_group)
-        readout_layout = QVBoxLayout()
-        readout_group.setLayout(readout_layout)
-
-        readout_button_layout = QHBoxLayout()
-        readout_layout.addLayout(readout_button_layout)
+        # --- Plot control layout ---
+        plot_control = QWidget()
+        plot_control_layout = QHBoxLayout()
+        plot_control.setLayout(plot_control_layout)
+        plot_layout.addWidget(plot_control)
+        plot_layout.addWidget(self.master_plot)
 
         self.clear_button = QPushButton("Clear")
         self.clear_button.clicked.connect(self.on_clear_clicked)
-        readout_button_layout.addWidget(self.clear_button)
+        plot_control_layout.addWidget(self.clear_button)
 
         self.save_button = QPushButton("Save Data")
         self.save_button.clicked.connect(self.on_save_clicked)
-        readout_button_layout.addWidget(self.save_button)
+        plot_control_layout.addWidget(self.save_button)
 
         self.save_image_button = QPushButton("Save Image")
         self.save_image_button.clicked.connect(self.on_save_image_clicked)
-        readout_button_layout.addWidget(self.save_image_button)
+        plot_control_layout.addWidget(self.save_image_button)
 
-        self.combine_button = QPushButton("Combine")
-        self.combine_button.clicked.connect(self.on_combine_toggled)
-        readout_button_layout.addWidget(self.combine_button)
-
-        self.active_button = QPushButton("Show Active")
-        self.active_button.clicked.connect(self.on_active_toggled)
-        readout_button_layout.addWidget(self.active_button)
-
-        self.auto_button = QPushButton("Auto Scale")
+        self.auto_button = QPushButton("Auto")
         self.auto_button.clicked.connect(self.on_auto_clicked)
-        readout_button_layout.addWidget(self.auto_button)
+        plot_control_layout.addWidget(self.auto_button)
 
-        self.convert_button = QPushButton("Convert Current")
-        self.convert_button.clicked.connect(self.on_convert_toggled)
-        readout_button_layout.addWidget(self.convert_button)
+        self.alive_button = QPushButton("Show Live")
+        # alive option is globally synced by alive_button and master_plot
+        self.alive_button.clicked.connect(self.on_alive_clicked)
+        plot_control_layout.addWidget(self.alive_button)
 
-        # --- Plotting Area with PyQtGraph (two PlotItems via GraphicsLayoutWidget) ---
-        self.plot_widget = pg.GraphicsLayoutWidget()
-        readout_layout.addWidget(self.plot_widget)
-        self.plot_widget.setBackground("w")
+        # --- Register settings ---
+        self.setting_groups = [SettingGroup(f"Channel {i+1}", self.settings[i]) for i in range(self.n_channels)]
+        for i in range(self.n_channels):
+            layout.addWidget(self.setting_groups[i], i+1, 1)
+            self.setting_groups[i].write_serial.connect(self.worker.write_serial)
+            self.setting_groups[i].auto_yrange.connect(partial(self.on_auto_yaxis, i))
 
-        # Top plot (channel 1 or combined)
-        self.plot_item1 = self.plot_widget.addPlot(row=0, col=0)
-        self.plot_item1.setLabel("left", "Voltage (V)")
-        self.plot_item1.setLabel("bottom", "Time (s)")
-        self.plot_item1.showGrid(x=True, y=True)
-        self.plot_item1.addLegend()
-
-        # Bottom plot (channel 2)
-        self.plot_item2 = self.plot_widget.addPlot(row=1, col=0)
-        self.plot_item2.setLabel("left", "Voltage (V)")
-        self.plot_item2.setLabel("bottom", "Time (s)")
-        self.plot_item2.showGrid(x=True, y=True)
-
-        # Disable all mouse interactions on both view boxes (pan/zoom/menus)
-        for pi in (self.plot_item1, self.plot_item2):
-            vb = pi.getViewBox()
-            #vb.setMouseEnabled(x=False, y=True)
-            vb.setMenuEnabled(False)
-
-        # plot curves: separate curve per plot item
-        self.plot_adc1 = self.plot_item1.plot([], [], pen=pg.mkPen("b", width=2), name="Chip 1")
-        self.plot_adc2 = self.plot_item1.plot([], [], pen=pg.mkPen("r", width=2), name="Chip 2")
-        self.plot2_adc2 = self.plot_item2.plot([], [], pen=pg.mkPen("r", width=2), name="Chip 2")
-        
+        # --- Start main logic ---
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_plot)
-        # aim to refresh roughly at sampling period
+        self.timer.timeout.connect(self.update)
         self.timer.start(int(1000 / REFRESH_RATE))
-        
-        self.auto_button.click()
+
+        self.master_timer = QTimer(self)
+        self.master_timer.timeout.connect(self.update_master)
+        self.master_timer.start(int(1000 / MASTER_REFRESH_RATE))
+
         self.refresh_button.click()
+        self.auto_button.click()
 
     def on_refresh_clicked(self):
         port_list = self.worker.refresh_port()
@@ -516,6 +411,7 @@ class LMP91000UI(QWidget):
             self.worker.disconnect()
             self.connect_button.setText("Connect")
         else:
+            self.connect_button.setText("Connect")
             # attempt connect using selected port (allow empty selection)
             port = self.port_combo.currentText() if self.port_combo.count() > 0 else ""
             if not port:
@@ -523,140 +419,101 @@ class LMP91000UI(QWidget):
                 return
             self.worker.connect(port)
             self.connect_button.setText("Disconnect")
-
-    def on_worker_settings_changed(self):
-        self.worker.blockSignals(True)  # Prevent signal loop
-        for settings_ui, settings in [
-            (self.c1_settings_ui, self.worker.c1_settings),
-            (self.c2_settings_ui, self.worker.c2_settings)]:
-            settings_ui.tia_gain_combo.setCurrentIndex(settings.tia_gain)
-            settings_ui.rload_combo.setCurrentIndex(settings.rload)
-            settings_ui.ref_source_combo.setCurrentIndex(settings.ref_source)
-            settings_ui.int_z_combo.setCurrentIndex(settings.int_z)
-            settings_ui.bias_sign_combo.setCurrentIndex(settings.bias_sign)
-            settings_ui.bias_combo.setCurrentIndex(settings.bias)
-            settings_ui.fet_short_combo.setCurrentIndex(settings.fet_short)
-            settings_ui.op_mode_combo.setCurrentIndex(settings.op_mode)
-        self.worker.blockSignals(False)
+            # write all register settings
+            for setting in self.settings:
+                self.worker.write_serial.emit(setting.update_all())
+            self.auto_button.click()
+            self.alive_button.click()
 
     def on_worker_log_message(self, msg):
         """Slot: receive log message from worker and display in UI."""
         self.log_output.append("<Serial> " + msg)
 
-    def on_switch_speed_changed(self):
-        switch_speed = float(self.switch_speed_combo.currentText())
-        self.worker.set_switch_settings(self.switch, switch_speed)
-        if self.switch:
-            self.log_output.append(f"Changed auto switching speed to {switch_speed} s")
-
-    def on_switch_enable_toggled(self):
-        if self.worker.is_running():
-            self.switch = not self.switch
-        else:
-            self.switch = False
-            return
-        
-        if self.switch:
-            switch_speed = float(self.switch_speed_combo.currentText())
-            self.worker.set_switch_settings(True, switch_speed)
-            self.switch_enable_button.setText("Disable")
-            for settings in [self.c1_settings_ui, self.c2_settings_ui]:
-                settings.op_mode_combo.setEnabled(False)
-            self.log_output.append(f"Enabled auto switching every {switch_speed} s.")
-        else:
-            self.switch_enable_button.setText("Enable")
-            self.worker.set_switch_settings(False)
-            for settings in [self.c1_settings_ui, self.c2_settings_ui]:
-                settings.op_mode_combo.setEnabled(True)
-            self.log_output.append("Disabled auto switching.")
-
     def on_clear_clicked(self):
-        self.worker.clear()
+        self.worker.clear_buffer.emit()
         self.log_output.append("Buffer cleared.")
 
     def on_save_clicked(self):
-        t, v1, v2 = self.worker.get(self.convert, self.active) # Save all data
+        timestamp, value = self.worker.get() # Save all data
         fname, _ = QFileDialog.getSaveFileName(self, "Save Data", "adc_data.csv", "CSV Files (*.csv)")
         if not fname:
             return
         with open(fname, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(["t", "adc1", "adc2"])
-            for i in range(len(t)):
-                writer.writerow([t[i], v1[i], v2[i]])
+            for i in range(len(timestamp)):
+                writer.writerow([timestamp[i], value[i, 0], value[i, 1]])
         self.log_output.append(f"Data saved to {fname}")
 
     def on_save_image_clicked(self):
-        pix = self.plot_widget.grab()
+        pix = combine_images_vertical([self.master_plot.grab()] + [plot.grab() for plot in self.plots])
         fname, _ = QFileDialog.getSaveFileName(self, "Save Image", "adc_plot.png", "PNG Files (*.png)")
         if not fname:
             return
         pix.save(fname)
         self.log_output.append(f"Image saved to {fname}")
 
-    def on_combine_toggled(self):
-        self.combine = not self.combine
-        if self.combine:
-            self.combine_button.setText("Split")
-            # show both channels in the top plot and hide the bottom plot
-            try:
-                self.plot_item2.hide()
-            except Exception:
-                pass
-            # keep top plot showing both curves
-            self.plot_adc2.show()
-        else:
-            self.combine_button.setText("Combine")
-            try:
-                self.plot_item2.show()
-            except Exception:
-                pass
-            # clear the extra top trace for the separate mode (we"ll plot channel2 in bottom)
-            self.plot_adc2.setData([])
-
-    def on_active_toggled(self):
-        self.active = not self.active
-
-        if self.active:
-            self.active_button.setText("Show All")
-        else:
-            self.active_button.setText("Show Active")
+    def on_auto_yaxis(self, idx):
+        self.plots[idx].setLabel("left", self.settings[idx].get_ylabel())
+        self.plots[idx].setYRange(*self.settings[idx].get_yrange())
 
     def on_auto_clicked(self):
-        _, ylim1, ylim2 = self.worker.get_axis_limit(self.convert)
-        if self.combine:
-            self.plot_item1.setYRange(min(ylim1[0], ylim2[0]), max(ylim1[1], ylim2[1]), padding=0)
-        else:
-            self.plot_item1.setYRange(ylim1[0], ylim1[1], padding=0)
-            self.plot_item2.setYRange(ylim2[0], ylim2[1], padding=0)
-        self.plot_item1.enableAutoRange(axis="x")
-        self.plot_item2.enableAutoRange(axis="x")
+        for i in range(self.n_channels):
+            self.on_auto_yaxis(i)
 
-    def on_convert_toggled(self):
-        self.convert = not self.convert
-        if self.convert:
-            self.convert_button.setText("Show Actual")
-            self.plot_item1.setLabel("left", "Current (uA)")
-            self.plot_item2.setLabel("left", "Current (uA)")
+    def on_alive_clicked(self):
+        self.alive_size = self.master_plot.region_size
+        self.alive_offset = 0
+        self.alive = True
+
+    def on_region_changed(self, xmin, xmax):
+        # Activates when user manually change the region
+        # Live logic:
+        # - When graph is alive
+        # -- The new region contains the last point, the graph is alive
+        # -- The graph is not alive if otherwise
+        # - When graph is not alive, it stays to be not alive
+        self.alive_size = xmax - xmin
+        if self.alive:
+            if self.master_plot.xmax < xmax and self.master_plot.xmax > xmin:
+                self.alive_offset = xmax - self.master_plot.xmax
+                self.alive = True
+            else:
+                self.alive = False
         else:
-            self.convert_button.setText("Show Current")
-            self.plot_item1.setLabel("left", "ADC Value")
-            self.plot_item2.setLabel("left", "ADC Value")
+            self.alive = False
+
+    def on_plot_mouse_moved(self, pos):
+        self.mouse_pos = pos
+
+    def update(self):
+        if self.alive:
+            end = self.worker.current_time + self.alive_offset
+            start = end - self.alive_size
+            self.master_plot.try_set_region(start, end)
+        else:
+            start, end = self.master_plot.get_region()
         
-        self.auto_button.click()
+        timestamp, value = self.worker.get(start, end, max_points=self.plot_max_points)
+        if not len(timestamp) == 0:
+            last = self.worker.at()
+            for i in range(self.n_channels):
+                self.plots[i].set_region(start, end)
+                self.plots[i].set_data(timestamp, value[:, i])
+                self.plots[i].set_last(last[i])
+            
+            mouse_pos = self.plots[0].vb.mapSceneToView(self.mouse_pos)
+            mouse_data = self.worker.at(mouse_pos.x())
+            for i in range(self.n_channels):
+                self.plots[i].set_line(mouse_pos.x(), mouse_data[i])
 
-    def update_plot(self):
-        timestamp, v1, v2 = self.worker.get(self.convert, self.active)
+    def update_master(self):
+        timestamp, value = self.worker.get(max_points=self.master_max_points)
+        if not len(timestamp) == 0:
+            self.master_plot.set_data(timestamp, value)
         
-        if self.combine:
-            self.plot_adc1.setData(timestamp, v1)
-            self.plot_adc2.setData(timestamp, v2)
-        else:
-            self.plot_adc1.setData(timestamp, v1)
-            self.plot2_adc2.setData(timestamp, v2)
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    gui = LMP91000UI()
+    gui = BLISSUI()
     gui.show()
     sys.exit(app.exec_())

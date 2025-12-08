@@ -1,4 +1,28 @@
-class LMP91000Settings:
+"""
+    Project: BLISS
+    Application: BLISS Sensor Board User Interface
+    File: src/device.py
+    Description: Device controls.
+    Author: Fang Zihang (Dr.)
+    Email: fang.zh@nus.edu.sg
+    Affiliation: National University of Singapore
+"""
+import numpy as np
+
+# --- CONSTANTS ---
+# * DO NOT CHANGE *
+DEBUG_MODE = False
+
+ADC_RESOLUTION = 10
+ADC_N = (1 << ADC_RESOLUTION)
+LMP91000_VREF = 3.0
+ADC_VREF = 3.3
+ADC_VSTEP = ADC_VREF / ADC_N
+
+LMP91000_TEMP_LUT = np.loadtxt("src/lmp91000_temp_lut.csv", delimiter=",", dtype=float)
+
+# --- LMP91000 constants ---
+class LMP91000:
     reg_keys = [
         "tia_gain",
         "rload",
@@ -9,12 +33,18 @@ class LMP91000Settings:
         "fet_short",
         "op_mode",
     ]
+    active_keys = [
+        "tia_gain",
+        "int_z",
+        "bias_sign",
+        "bias",
+        "op_mode",
+    ]
 
     ## TIACN -- TIA control register (address 0x10)
     tiacn_reg = 0x10
 
     # Transimpedance amplifier gain settings 
-    tia_gain_mask = 0b00011100
     tia_gain_shift = 2
     tia_gain_bin = [
         0b000,
@@ -36,10 +66,10 @@ class LMP91000Settings:
         "120 kΩ",
         "350 kΩ",
     ]
+    tia_gain_label = "Gain"
     tia_gain_default = 6    # index for "120 kΩ"
 
     # Load resistance settings
-    rload_mask = 0b00000011
     rload_shift = 0
     rload_bin = [
         0b00,
@@ -53,13 +83,13 @@ class LMP91000Settings:
         "50 Ω",
         "100 Ω",
     ]
+    rload_label = "Rload"
     rload_default = 3   # index for "100 Ω"
 
     ## REFCN -- Reference control register (address 0x11)
     refcn_reg = 0x11
 
     # Reference voltage source selection
-    ref_source_mask = 0b10000000
     ref_source_shift = 7
     ref_source_bin = [
         0b0,
@@ -69,10 +99,10 @@ class LMP91000Settings:
         "Internal",
         "External",
     ]
+    ref_source_label = "Source"
     ref_source_default = 1  # index for "External"
 
     # Internal zero selection, percentage of the source reference
-    int_z_mask = 0b01100000
     int_z_shift = 5
     int_z_bin = [
         0b00,
@@ -86,10 +116,10 @@ class LMP91000Settings:
         "67%",
         "Bypass",
     ]
+    int_z_label = "Vref"
     int_z_default = 1   # index for "50%"
 
     # Bias polarity selection, (V_WE - V_RE) sign
-    bias_sign_mask = 0b00010000
     bias_sign_shift = 4
     bias_sign_bin = [
         0b0,
@@ -99,10 +129,10 @@ class LMP91000Settings:
         "Negative WE<RE",
         "Positive WE>RE",
     ]
+    bias_sign_label = "Bias ±"
     bias_sign_default = 1   # index for "Positive WE>RE"
 
     # Bias voltage level, percentage of the source reference
-    bias_mask = 0b00001111
     bias_shift = 0
     bias_bin = [
         0b0000,
@@ -136,13 +166,13 @@ class LMP91000Settings:
         "22%",
         "24%",
     ]
+    bias_label = "Vbias"
     bias_default = 0    # index for "0%"
 
     ## MODECN -- Mode control register (address 0x12)
     modecn_reg = 0x12
 
     # Shorting FET
-    fet_short_mask = 0b10000000
     fet_short_shift = 7
     fet_short_bin = [
         0b0,
@@ -152,10 +182,10 @@ class LMP91000Settings:
         "Disabled",
         "Enabled",
     ]
+    fet_short_label = "FET"
     fet_short_default = 0   # index for "Disabled"
 
     # Operating mode
-    op_mode_mask = 0b00000111
     op_mode_shift = 0
     op_mode_bin = [
         0b000,
@@ -173,6 +203,7 @@ class LMP91000Settings:
         "Temp (TIA off)",
         "Temp (TIA on)",
     ]
+    op_mode_label = "Mode"
     op_mode_default = 0 # index for "Deep sleep"
 
     # --- Application specific values (kept lowercase) ---
@@ -200,9 +231,11 @@ class LMP91000Settings:
         True,
         True,
     ]
+    volt_lut = LMP91000_TEMP_LUT[:, 0]
+    temp_lut = LMP91000_TEMP_LUT[:, 1]
 
-    def __init__(self, chip, vref=LMP91000_VREF):
-        self.chip = chip
+    def __init__(self, id, vref=LMP91000_VREF):
+        self.id = id
         self.vref = vref
 
         self.tia_gain = self.tia_gain_default
@@ -215,8 +248,8 @@ class LMP91000Settings:
         self.op_mode = self.op_mode_default
 
         self.active = self.active_value[self.op_mode]
-        self.gain = self.gain_value[self.tia_gain]
-        self.z = self.z_value[self.int_z]
+        self.gain_val = self.gain_value[self.tia_gain]
+        self.z_val = self.z_value[self.int_z]
 
         # Update int_z text
         self.int_z_text = self._int_z_text.copy()
@@ -234,53 +267,38 @@ class LMP91000Settings:
             value = self.vref * precent_float
             self.bias_text[i] = f"{value:.2f} V"
 
-    def get_all(self, key):
-        if key in LMP91000Settings.reg_keys:
-            attr = getattr(self, key + "_text")
-            return list(attr)
-        else:
-            return [""]
-
-    def get_current(self, key):
-        if key in LMP91000Settings.reg_keys:
-            attr = getattr(self, key + "_text")
-            index = getattr(self, key)
-            return attr[index]
-        else:
-            return ""
-
     def update_tiacn(self):
-        tia_gain_val = self.tia_gain_bin[self.tia_gain] << self.tia_gain_shift
-        rload_val = self.rload_bin[self.rload] << self.rload_shift
-        tiacn_val = tia_gain_val | rload_val
+        tia_gain = self.tia_gain_bin[self.tia_gain] << self.tia_gain_shift
+        rload = self.rload_bin[self.rload] << self.rload_shift
+        tiacn = tia_gain | rload
         
-        self.gain = self.gain_value[self.tia_gain]
-        return "WRITE %d %d %d\n"%(self.chip, self.tiacn_reg, tiacn_val)
+        self.gain_val = self.gain_value[self.tia_gain]
+        return "WRITE %d %d %d\n"%(self.id, self.tiacn_reg, tiacn)
 
     def update_refcn(self):
-        ref_source_val = self.ref_source_bin[self.ref_source] << self.ref_source_shift
-        int_z_val = self.int_z_bin[self.int_z] << self.int_z_shift
-        bias_sign_val = self.bias_sign_bin[self.bias_sign] << self.bias_sign_shift
-        bias_val = self.bias_bin[self.bias] << self.bias_shift
-        refcn_val = ref_source_val | int_z_val | bias_sign_val | bias_val
+        ref_source = self.ref_source_bin[self.ref_source] << self.ref_source_shift
+        int_z = self.int_z_bin[self.int_z] << self.int_z_shift
+        bias_sign = self.bias_sign_bin[self.bias_sign] << self.bias_sign_shift
+        bias = self.bias_bin[self.bias] << self.bias_shift
+        refcn = ref_source | int_z | bias_sign | bias
         
-        self.z = self.z_value[self.int_z]
-        return  "WRITE %d %d %d\n"%(self.chip, self.refcn_reg, refcn_val)
+        self.z_val = self.z_value[self.int_z]
+        return  "WRITE %d %d %d\n"%(self.id, self.refcn_reg, refcn)
 
     def update_modecn(self):
-        fet_short_val = self.fet_short_bin[self.fet_short] << self.fet_short_shift
-        op_mode_val = self.op_mode_bin[self.op_mode] << self.op_mode_shift
-        modecn_val = fet_short_val | op_mode_val
+        fet_short = self.fet_short_bin[self.fet_short] << self.fet_short_shift
+        op_mode = self.op_mode_bin[self.op_mode] << self.op_mode_shift
+        modecn = fet_short | op_mode
         
         self.active = self.active_value[self.op_mode]
-        return  "WRITE %d %d %d\n"%(self.chip, self.modecn_reg, modecn_val)
+        return  "WRITE %d %d %d\n"%(self.id, self.modecn_reg, modecn)
 
     def update(self, key, index):
-        """Update a single setting and return (chip, register, value) tuple to write."""
-        if key not in LMP91000Settings.reg_keys:
+        """Update a single setting and return (id, register, value) tuple to write."""
+        if key not in self.reg_keys:
             return None
-        
         setattr(self, key, index)
+
         # return register write tuple
         if key in ("tia_gain", "rload"):
             return self.update_tiacn()
@@ -292,3 +310,96 @@ class LMP91000Settings:
     def update_all(self):
         """Return list of register write commands for all config registers."""
         return self.update_tiacn() + self.update_refcn() + self.update_modecn()
+    
+    def get_yrange(self):
+        if DEBUG_MODE:
+            return 0x000, 0x3FF
+        if self.op_mode == 0:
+            return 0, self.vref
+        if self.op_mode in [4, 5]:
+            return 20, 50
+        z_voltage = self.vref * self.z_val
+        ymin = (-z_voltage) / self.gain_val * 1e3  # uA
+        ymax = (self.vref - z_voltage) / self.gain_val * 1e3  # uA
+        return ymin, ymax
+    
+    def get_ylabel(self):
+        if DEBUG_MODE:
+            return "DEBUG MODE"
+        if self.op_mode == 0:
+            return "Voltage (V)"
+        if self.op_mode in [4, 5]:  # Temperature sensor
+            return "Temp (°C)"
+        return "Current (uA)"
+    
+    def formula(self, x):
+        if DEBUG_MODE:
+            return x
+        if self.op_mode == 0:
+            return x * ADC_VSTEP
+        if self.op_mode in [4, 5]:  # Temperature sensor
+            return np.interp(x * ADC_VSTEP, self.volt_lut, self.temp_lut)
+        return ((x * ADC_VSTEP - self.vref * self.z_val) / self.gain_val * 1e3)
+    
+class PHSensor:
+    reg_keys = [
+        "gain",
+    ]
+    active_keys = [
+        "gain",
+    ]
+    gain_text = [
+        "1x",
+        "10x",
+        "40x",
+        # "200x",
+    ]
+    gain_label = "Gain"
+    gain_default = 0    # 1x
+
+    gain_value = [
+        1,
+        10,
+        40,
+        200,
+    ]
+
+    def __init__(self, id):
+        self.id = id
+
+        self.gain = self.gain_default
+        
+        self.update_gain()
+
+    def update_gain(self):
+        self.gain_val = self.gain_value[self.gain]
+        return "WRITE %d %d %d\n"%(self.id, 0, self.gain)
+
+    def update(self, key, index):
+        if key not in self.reg_keys:
+            return None
+        setattr(self, key, index)
+
+        return self.update_gain()
+
+    def update_all(self):
+        return self.update_gain()
+
+    def get_yrange(self):
+        if DEBUG_MODE:
+            return 0x000, 0x3FF
+        return self.formula(0x200), self.formula(0x1FF)
+
+    def get_ylabel(self):
+        if DEBUG_MODE:
+            return "DEBUG MODE"
+        return "Voltage (V)"
+
+    def formula(self, x):
+        if DEBUG_MODE:
+            return x
+        # 0x200 to 0x3FF, -512 to -1
+        # 0x000 to 0x1FF, 0 to 511
+        if x > 0x1FF:
+            x = x - 0x400
+        return (x * ADC_VSTEP * 2) / self.gain_val

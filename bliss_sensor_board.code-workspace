@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "bliss_sensor_board",
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"pins_arduino.h": "c"
+		}
+	}
+}
