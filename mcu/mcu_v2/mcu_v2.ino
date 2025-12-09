@@ -4,7 +4,7 @@
     File: mcu_v2.ino
     Description: Arduino MCU control code (ATMEGA32U4)
     Author: Fang Zihang (Dr.)
-    Email: fang.zh@nus.edu.sg
+    Email: zh.fang@nus.edu.sg
     Affiliation: National University of Singapore
 */
 

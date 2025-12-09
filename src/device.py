@@ -4,7 +4,7 @@
     File: src/device.py
     Description: Device controls.
     Author: Fang Zihang (Dr.)
-    Email: fang.zh@nus.edu.sg
+    Email: zh.fang@nus.edu.sg
     Affiliation: National University of Singapore
 """
 import numpy as np

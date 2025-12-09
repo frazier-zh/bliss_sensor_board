@@ -4,7 +4,7 @@
     File: src/ui.py
     Description: Main UI and logic.
     Author: Fang Zihang (Dr.)
-    Email: fang.zh@nus.edu.sg
+    Email: zh.fang@nus.edu.sg
     Affiliation: National University of Singapore
 """
 # --- Python packages ---
@@ -32,7 +32,7 @@ ADC_SAMPLE_RATE = 20
 N_CHANNELS = 4
 
 # * OK TO CHANGE *
-DEFAULT_SIZE = 300  # 5 mins
+DEFAULT_SIZE = 60  # 1 mins
 MEMORY_SIZE = 360000
 REFRESH_RATE = 30
 
@@ -311,6 +311,7 @@ class BLISSUI(QWidget):
         # --- Master plot ---
         self.live = True
         self.plot_update = True
+        self.marker_update = False
         self.live_size = DEFAULT_SIZE
         self.live_offset = 0
         self.master_plot = MasterPlot(
@@ -330,13 +331,13 @@ class BLISSUI(QWidget):
         self.plots = [Plot(color=COLORS[i], linewidth=LINEWIDTH, color2=SECONDARY_COLOR) for i in range(self.n_channels)]
         self.plot_max_points = PLOT_MAX_POINTS
         self.mouse_pos = QPointF(0, 0)
-        self.mouse_update = True
         for i in range(self.n_channels):
             layout.addWidget(self.plots[i], i+1, 0)
             self.plots[i].setBackground(BACKGROUD_COLOR)
             self.plots[i].set_axis_style(PLOT_AXIS_STYLE)
             self.plots[i].showGrid(x=True, y=True, alpha=0.2)
             self.plots[i].scene().sigMouseMoved.connect(self.on_plot_mouse_moved)
+            self.plots[i].marker_changed.connect(self.master_plot.set_marker)
         self.plots[-1].getAxis("bottom").setStyle(showValues=True)
         self.plots[-1].setLabel("bottom", "Time (s)")
         
@@ -494,7 +495,6 @@ class BLISSUI(QWidget):
 
     def on_plot_mouse_moved(self, pos):
         self.mouse_pos = pos
-        self.mouse_update = True
 
     def update(self):
         # update plot value
@@ -521,24 +521,28 @@ class BLISSUI(QWidget):
         
         # update last value
         last = self.worker.at()
-        for i in range(self.n_channels):
-            self.plots[i].set_last(last[i], f"X: {current:.1f}\nY: {last[i]:.2f}")
-
         # update mouse line
         mouse_pos = self.plots[0].vb.mapSceneToView(self.mouse_pos)
         x = mouse_pos.x()
         mouse_data = self.worker.at(x)
         for i in range(self.n_channels):
-            self.plots[i].set_line(x, f"X  : {x:.1f}\nΔX: {current-x:.1f}\nY  : {mouse_data[i]:.2f}")
+            self.plots[i].set_last(last[i], f"X: {current:.1f}\nY: {last[i]:.2f}")
+            self.plots[i].set_line(x, f"X  : {x:.1f}\nΔX: {x-current:.1f}\nY  : {mouse_data[i]:.2f}")
+
+        # update
+        for i in range(self.n_channels):
+            self.plots[i].update()
         
         # reset update indicator
-        self.mouse_update = False
         self.plot_update = False
 
     def update_master(self):
         timestamp, value = self.worker.get(max_points=self.master_max_points)
         if not len(timestamp) == 0:
             self.master_plot.set_data(timestamp, value)
+
+        # update markers
+        self.master_plot.update()
         
 if __name__ == "__main__":
     app = QApplication(sys.argv)

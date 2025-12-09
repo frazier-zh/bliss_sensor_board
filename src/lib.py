@@ -4,7 +4,7 @@
     File: src/lib.py
     Description: Utility classes.
     Author: Fang Zihang (Dr.)
-    Email: fang.zh@nus.edu.sg
+    Email: zh.fang@nus.edu.sg
     Affiliation: National University of Singapore
 """
 

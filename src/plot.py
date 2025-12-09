@@ -4,12 +4,42 @@
     File: src/plot.py
     Description: Plot class based on PyQtGraph.
     Author: Fang Zihang (Dr.)
-    Email: fang.zh@nus.edu.sg
+    Email: zh.fang@nus.edu.sg
     Affiliation: National University of Singapore
 """
 from PyQt5.QtCore import pyqtSignal, Qt
+from PyQt5.QtGui import QPainterPath
 import pyqtgraph as pg
 import numpy
+
+class Marker(pg.TargetItem):
+    def __init__(self, **kwargs):
+        path = QPainterPath()
+        # Symbol:
+        #  +---+
+        #  |   |
+        #   \ /
+        #    +  (0, 0)
+        path.moveTo(0, 0)
+        path.lineTo(-0.4, -0.4)
+        path.lineTo(-0.4, -1)
+        path.lineTo(0.4, -1)
+        path.lineTo(0.4, -0.4)
+        path.closeSubpath()
+        super().__init__(symbol=path, **kwargs)
+        self.recycle = False
+
+    def mouseClickEvent(self, ev):
+        if not ev.button() == Qt.MouseButton.RightButton:
+            return
+        ev.accept()
+        self.recycle = True
+
+    def hoverEvent(self, ev):
+        if (not ev.isExit()) and ev.acceptDrags(Qt.MouseButton.LeftButton):
+            self.setMouseHover(True)
+        else:
+            self.setMouseHover(False)
 
 class PlotViewBox(pg.ViewBox):
     def wheelEvent(self, ev, axis=None):
@@ -33,6 +63,8 @@ class PlotViewBox(pg.ViewBox):
         self.sigRangeChangedManually.emit(mask)
 
 class Plot(pg.PlotWidget):
+    marker_changed = pyqtSignal(Marker)
+
     def __init__(self,
                 color="r",
                 color2="w",
@@ -59,6 +91,19 @@ class Plot(pg.PlotWidget):
         self.line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(color2, width=1))
         self.addItem(self.line, ignoreBounds=True)
         self.line_label = pg.InfLineLabel(self.line, "", position=0.7)
+
+        self.markers = []
+
+    def update(self):
+        # handle all the remaining plot item update
+        
+        # clean up dead markers
+        recycle_markers = [marker for marker in self.markers if marker.recycle]
+        if not len(recycle_markers) == 0:
+            for marker in recycle_markers:
+                self.markers.remove(marker)
+                self.removeItem(marker)
+                self.marker_changed.emit(marker)
 
     def set_data(self, x, y):
         self.data.setData(x, y)
@@ -89,6 +134,14 @@ class Plot(pg.PlotWidget):
                 axis.setWidth(axis_style["width"])
             if "height" in axis_style:
                 axis.setHeight(axis_style["height"])
+
+    def mouseDoubleClickEvent(self, ev):
+        ev.accept()
+        pos = self.vb.mapSceneToView(ev.pos())
+        new_marker = Marker(pos=pos, size=16, brush="#1ad5ff", movable=False)
+        self.addItem(new_marker, ignoreBounds=True)
+        self.markers.append(new_marker)
+        self.marker_changed.emit(new_marker)
 
 class MasterViewBox(pg.ViewBox):
     scale_changed = pyqtSignal(float)
@@ -147,6 +200,9 @@ class MasterPlot(pg.PlotWidget):
             swapMode="push",
         )
         self.addItem(self.region, ignoreBounds=True)
+        
+        self.markers = {}
+
         self.vb.scale_changed.connect(self.on_viewbox_scale_changed)
         self.vb.mouse_clicked.connect(self.on_viewbox_mouse_clicked)
         self.region.sigRegionChanged.connect(self.on_region_changed)
@@ -161,6 +217,24 @@ class MasterPlot(pg.PlotWidget):
     def try_set_region(self, xmin, xmax):
         if not self.user_input:
             self.set_region(xmin, xmax)
+
+    def set_marker(self, marker):
+        if marker.recycle:
+            # remove previous markers
+            if marker in self.markers:
+                master_marker = self.markers[marker]
+                self.removeItem(master_marker)
+            self.markers.pop(marker)
+        else:
+            # create new markers
+            pos = marker.pos()
+            pos[1] = 0
+            new_marker = Marker(pos=pos, size=10, brush="#1ad5ff", movable=False)
+            self.addItem(new_marker, ignoreBounds=True)
+            self.markers[marker] = new_marker
+
+    def update(self):
+        pass
 
     def set_region(self, xmin, xmax):
         self.region.blockSignals(True)
