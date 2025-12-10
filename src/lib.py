@@ -147,11 +147,11 @@ class storage:
         
     def at(self, time: Optional[float] = None):
         if self.count == 0:
-            return np.zeros(self.n_channels)
+            return 0, np.zeros(self.n_channels)
         if time is None:
-            return self._data[self.count - 1, :]
+            return self._timestamp[self.count - 1], self._data[self.count - 1, :]
         time_idx = self._binary_search_timestamp(time)
-        return self._data[time_idx, :]
+        return self._timestamp[time_idx], self._data[time_idx, :]
 
     def clear(self):
         with self._lock:

@@ -449,9 +449,10 @@ class BLISSUI(QWidget):
             return
         with open(fname, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["t", "adc1", "adc2"])
+            header = ["t"] + [f"ch{c}" for c in range(self.n_channels)]
+            writer.writerow(header)
             for i in range(len(timestamp)):
-                writer.writerow([timestamp[i], value[i, 0], value[i, 1]])
+                writer.writerow([timestamp[i]] + [value[i, c] for c in range(self.n_channels)])
         self.log_output.append(f"Data saved to {fname}")
 
     def on_save_image_clicked(self):
@@ -520,14 +521,13 @@ class BLISSUI(QWidget):
                         self.plots[i].set_data(timestamp, value[:, i])
         
         # update last value
-        last = self.worker.at()
+        last_t, last_data = self.worker.at()
         # update mouse line
         mouse_pos = self.plots[0].vb.mapSceneToView(self.mouse_pos)
-        x = mouse_pos.x()
-        mouse_data = self.worker.at(x)
+        mouse_t, mouse_data = self.worker.at(mouse_pos.x())
         for i in range(self.n_channels):
-            self.plots[i].set_last(last[i], f"X: {current:.1f}\nY: {last[i]:.2f}")
-            self.plots[i].set_line(x, f"X  : {x:.1f}\nΔX: {x-current:.1f}\nY  : {mouse_data[i]:.2f}")
+            self.plots[i].set_last(last_data[i], f"X: {last_t:.1f}\nY: {last_data[i]:.2f}")
+            self.plots[i].set_line(mouse_t, f"X  : {mouse_t:.1f}\nΔX: {mouse_t-current:.1f}\nY  : {mouse_data[i]:.2f}")
 
         # update
         for i in range(self.n_channels):
