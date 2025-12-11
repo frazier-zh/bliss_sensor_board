@@ -8,6 +8,16 @@
     Affiliation: National University of Singapore
 """
 import numpy as np
+import os
+import sys
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # --- CONSTANTS ---
 # * DO NOT CHANGE *
@@ -19,7 +29,7 @@ LMP91000_VREF = 3.0
 ADC_VREF = 3.3
 ADC_VSTEP = ADC_VREF / ADC_N
 
-LMP91000_TEMP_LUT = np.loadtxt("src/lmp91000_temp_lut.csv", delimiter=",", dtype=float)
+LMP91000_TEMP_LUT = np.loadtxt(resource_path("lmp91000_temp_lut.csv"), delimiter=",", dtype=float)
 
 # --- LMP91000 constants ---
 class LMP91000:
