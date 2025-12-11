@@ -135,6 +135,10 @@ class Plot(pg.PlotWidget):
             if "height" in axis_style:
                 axis.setHeight(axis_style["height"])
 
+    def clear_marker(self):
+        for marker in self.markers:
+            marker.recycle = True
+
     def mouseDoubleClickEvent(self, ev):
         ev.accept()
         pos = self.vb.mapSceneToView(ev.pos())

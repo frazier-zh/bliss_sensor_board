@@ -147,8 +147,7 @@ class SerialWorker(QThread):
         while True:
             self.current_time = time.time() - self.start_time
             if not self.running:
-                self.memory.append(0, self.current_time)
-                time.sleep(0.01)
+                time.sleep(0.1)
                 continue
             if self.simulate:
                 self.simulate_data()
@@ -440,6 +439,9 @@ class BLISSUI(QWidget):
 
     def on_clear_clicked(self):
         self.worker.clear_buffer.emit()
+        for plot in self.plots:
+            plot.clear_marker()
+        self.live = True
         self.log_output.append("Buffer cleared.")
 
     def on_save_clicked(self):
